@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux GCC
+            os: ubuntu-latest
+            cxx: g++
+          - name: Linux Clang
+            os: ubuntu-latest
+            cxx: clang++
+          - name: macOS
+            os: macos-latest
+          - name: Windows MSVC
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Clang
+        if: matrix.cxx == 'clang++'
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.cxx }}" ]; then
+            export CXX="${{ matrix.cxx }}"
+          fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
