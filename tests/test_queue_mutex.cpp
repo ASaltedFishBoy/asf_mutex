@@ -362,6 +362,46 @@ void test_tls() {
   }
 }
 
+// Hold the mutex, queue 64 lock waiters, and keep them blocked long enough that
+// ASF_LOCK_SPIN=0 forces park_word (futex / WaitOnAddress / ulock).
+void test_lock_os_park() {
+  const std::uint64_t parks_before = asf::park_count();
+  asf::queue_mutex mutex;
+  asf::queue_mutex::lock_node held;
+  mutex.lock(held);
+
+  constexpr int kThreads = 64;
+  std::atomic<int> ready{0};
+  std::atomic<int> entered{0};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&] {
+      ready.fetch_add(1, std::memory_order_relaxed);
+      asf::queue_mutex::lock_node node;
+      mutex.lock(node);
+      entered.fetch_add(1, std::memory_order_relaxed);
+      mutex.unlock(node);
+    });
+  }
+  while (ready.load(std::memory_order_relaxed) < kThreads) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  expect(entered.load(std::memory_order_relaxed) == 0, "park waiters entered while held");
+  const std::uint64_t parks = asf::park_count() - parks_before;
+  expect(parks > 0, "park waiters did not call OS park");
+  std::printf("lock os park threads %d parks %llu\n", kThreads,
+              static_cast<unsigned long long>(parks));
+  std::fflush(stdout);
+
+  mutex.unlock(held);
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  expect(entered.load(std::memory_order_relaxed) == kThreads, "park waiters did not all enter");
+}
+
 }  // namespace
 
 int main() {
@@ -369,6 +409,7 @@ int main() {
   test_try_fails_while_held();
   test_lock_waits_for_try();
   test_tls();
+  test_lock_os_park();
   test_stress();
   test_churn();
   if (g_failures.load() != 0) {
