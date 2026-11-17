@@ -7,6 +7,9 @@ target_compile_features(queue_mutex INTERFACE cxx_std_17)
 target_include_directories(queue_mutex INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 find_package(Threads REQUIRED)
+if(WIN32)
+  target_link_libraries(queue_mutex INTERFACE Synchronization)
+endif()
 
 function(asf_mutex_binary target)
   target_link_libraries(${target} PRIVATE queue_mutex Threads::Threads)
@@ -21,7 +24,8 @@ function(asf_mutex_binary target)
 endfunction()
 
 add_executable(test_queue_mutex tests/test_queue_mutex.cpp)
-target_compile_definitions(test_queue_mutex PRIVATE ASF_TRY_SPIN=0)
+# Zero spin budgets so try fails immediately and lock waiters OS-park.
+target_compile_definitions(test_queue_mutex PRIVATE ASF_TRY_SPIN=0 ASF_LOCK_SPIN=0 ASF_COUNT_PARK)
 asf_mutex_binary(test_queue_mutex)
 
 add_executable(bench_mutex bench/bench_mutex.cpp)

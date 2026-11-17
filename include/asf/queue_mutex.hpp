@@ -25,6 +25,23 @@
 #include <new>
 #include <thread>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#elif defined(__linux__)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#elif defined(__APPLE__)
+extern "C" int __ulock_wait(uint32_t operation, void* addr, uint64_t value, uint32_t timeout);
+extern "C" int __ulock_wake(uint32_t operation, void* addr, uint64_t wake_value);
+#endif
+
 #if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
 #include <immintrin.h>
 #elif defined(_MSC_VER) && (defined(_M_ARM64) || defined(_M_ARM))
@@ -38,10 +55,36 @@ namespace asf {
 #define ASF_TRY_SPIN 256
 #endif
 
+// lock wait spins before OS park. -DASF_LOCK_SPIN overrides the total budget.
+#ifndef ASF_LOCK_SPIN
+#define ASF_LOCK_SPIN 256
+#endif
+
+// Pause iterations assumed to happen inside the OS park call itself, subtracted
+// from ASF_LOCK_SPIN so the overall spin stays near that budget.
+// WaitOnAddress spins with pause before the kernel wait (Microsoft STL); the
+// exact count is undocumented. 256 is the Windows sync spin Wine-NSPA
+// calibrated against native SRW-style waiting. futex / ulock do not spin.
+#ifndef ASF_LOCK_PARK_SPIN
+#if defined(_WIN32)
+#define ASF_LOCK_PARK_SPIN 256
+#else
+#define ASF_LOCK_PARK_SPIN 0
+#endif
+#endif
+
 #if !defined(NDEBUG) && !defined(__OPTIMIZE__)
 #define ASF_CHECK(cond) assert(cond)
 #else
 #define ASF_CHECK(cond) ((void)0)
+#endif
+
+#if defined(ASF_COUNT_PARK)
+inline std::atomic<std::uint64_t> g_park_calls{0};
+
+inline std::uint64_t park_count() noexcept {
+  return g_park_calls.load(std::memory_order_relaxed);
+}
 #endif
 
 class queue_mutex {
@@ -105,6 +148,10 @@ class queue_mutex {
   // Head polls this many times, then gives up. Later arrivals wait to become
   // head, so the budget is part of the failure order and is not per call.
   static constexpr std::uint32_t kTrySpin = ASF_TRY_SPIN;
+  // Non-head lock waiters spin this many relaxes, then park on the node word.
+  // On Windows, ASF_LOCK_PARK_SPIN is deducted for WaitOnAddress's own pause loop.
+  static constexpr std::uint32_t kLockSpin =
+      ASF_LOCK_SPIN > ASF_LOCK_PARK_SPIN ? ASF_LOCK_SPIN - ASF_LOCK_PARK_SPIN : 0;
   static constexpr std::uint32_t kTry = 1;
   static constexpr std::uint32_t kLock = 2;
 
@@ -166,12 +213,14 @@ class queue_mutex {
     std::uint64_t cur = node.word.load(std::memory_order_relaxed);
     while (!cas(node.word, cur, cur | kGrant)) {
     }
+    wake_word(node.word);
   }
 
   static void mark_head(lock_node& node) {
     std::uint64_t cur = node.word.load(std::memory_order_relaxed);
     while (!cas(node.word, cur, cur | kHead)) {
     }
+    wake_word(node.word);
   }
 
   void wait_lock(lock_node& self);
@@ -184,6 +233,8 @@ class queue_mutex {
   void retire(try_node& self);
   void handoff();
   static void relax(std::uint32_t& spins) noexcept;
+  static void park_word(std::atomic<std::uint64_t>& word, std::uint64_t expected) noexcept;
+  static void wake_word(std::atomic<std::uint64_t>& word) noexcept;
 
   struct tls_hold {
     union {
@@ -261,6 +312,43 @@ inline void queue_mutex::relax(std::uint32_t& spins) noexcept {
   }
 }
 
+inline void queue_mutex::park_word(std::atomic<std::uint64_t>& word,
+                                   std::uint64_t expected) noexcept {
+#if defined(ASF_COUNT_PARK)
+  g_park_calls.fetch_add(1, std::memory_order_relaxed);
+#endif
+#if defined(_WIN32)
+  WaitOnAddress(static_cast<volatile void*>(&word), &expected, sizeof(expected), INFINITE);
+#elif defined(__linux__)
+  // Flags live in the low bits; futex watches one 32-bit cell of the word.
+  auto* cell = reinterpret_cast<int*>(&word);
+  const auto was = static_cast<int>(static_cast<std::uint32_t>(expected));
+  syscall(SYS_futex, cell, FUTEX_WAIT_PRIVATE, was, nullptr, nullptr, 0);
+#elif defined(__APPLE__)
+  // UL_COMPARE_AND_WAIT: 32-bit compare on the flag half of the word.
+  constexpr std::uint32_t kUlCompareAndWait = 1u;
+  __ulock_wait(kUlCompareAndWait, &word,
+               static_cast<std::uint64_t>(static_cast<std::uint32_t>(expected)), 0);
+#else
+  (void)expected;
+  std::this_thread::yield();
+#endif
+}
+
+inline void queue_mutex::wake_word(std::atomic<std::uint64_t>& word) noexcept {
+#if defined(_WIN32)
+  WakeByAddressSingle(static_cast<void*>(&word));
+#elif defined(__linux__)
+  auto* cell = reinterpret_cast<int*>(&word);
+  syscall(SYS_futex, cell, FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+#elif defined(__APPLE__)
+  constexpr std::uint32_t kUlCompareAndWait = 1u;
+  __ulock_wake(kUlCompareAndWait, &word, 0);
+#else
+  (void)word;
+#endif
+}
+
 inline void queue_mutex::wait_lock(lock_node& self) {
   std::uint32_t spins = 0;
   for (;;) {
@@ -270,14 +358,22 @@ inline void queue_mutex::wait_lock(lock_node& self) {
       return;
     }
     if ((word & kHead) != 0) {
+      // Head must poll state_. try unlock frees the owner without touching this
+      // word, so parking here would miss the handoff.
       std::uint64_t state = state_.load(std::memory_order_relaxed);
       if (owner_of(state) == kFree && cas(state_, state, with_owner(state, kLock))) {
         grant_lock(self);
         std::atomic_thread_fence(std::memory_order_acquire);
         return;
       }
+      relax(spins);
+      continue;
     }
-    relax(spins);
+    if (spins < kLockSpin) {
+      relax(spins);
+      continue;
+    }
+    park_word(self.word, word);
   }
 }
 
@@ -641,5 +737,7 @@ inline void queue_mutex::unlock_try() { unlock(tls_.held_try); }
 
 #undef ASF_CHECK
 #undef ASF_TRY_SPIN
+#undef ASF_LOCK_SPIN
+#undef ASF_LOCK_PARK_SPIN
 
 }  // namespace asf
