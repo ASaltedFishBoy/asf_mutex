@@ -95,18 +95,7 @@ Sample bench_std(int threads, Hold hold) {
 }
 
 template <typename Hold>
-Sample bench_stack(int threads, Hold hold) {
-  asf::queue_mutex mutex;
-  return run(threads, [&](std::uint64_t& sink) {
-    asf::queue_mutex::lock_node node;
-    mutex.lock(node);
-    hold(sink);
-    mutex.unlock(node);
-  });
-}
-
-template <typename Hold>
-Sample bench_tls(int threads, Hold hold) {
+Sample bench_queue(int threads, Hold hold) {
   asf::queue_mutex mutex;
   return run(threads, [&](std::uint64_t& sink) {
     mutex.lock();
@@ -120,8 +109,7 @@ void sweep(const char* work, Hold hold) {
   const int threads[] = {1, 2, 4, 8, 16};
   for (int n : threads) {
     report("std::mutex", n, work, bench_std(n, hold));
-    report("queue_mutex stack", n, work, bench_stack(n, hold));
-    report("queue_mutex tls", n, work, bench_tls(n, hold));
+    report("queue_mutex", n, work, bench_queue(n, hold));
   }
 }
 

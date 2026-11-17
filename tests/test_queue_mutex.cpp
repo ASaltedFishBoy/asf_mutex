@@ -52,33 +52,24 @@ void expect(bool cond, const char* what) {
 
 void test_uncontended() {
   asf::queue_mutex mutex;
-  {
-    asf::queue_mutex::lock_node node;
-    mutex.lock(node);
-    mutex.unlock(node);
+  mutex.lock();
+  mutex.unlock();
+  if (mutex.try_lock()) {
+    mutex.unlock();
+  } else {
+    expect(false, "uncontended try_lock");
   }
-  {
-    asf::queue_mutex::try_node node;
-    if (mutex.try_lock(node)) {
-      mutex.unlock(node);
-    } else {
-      expect(false, "uncontended try_lock");
-    }
-  }
-  asf::queue_mutex::lock_node again;
-  mutex.lock(again);
-  mutex.unlock(again);
+  mutex.lock();
+  mutex.unlock();
 }
 
 void test_try_fails_while_held() {
   asf::queue_mutex mutex;
-  asf::queue_mutex::lock_node held;
-  mutex.lock(held);
-  asf::queue_mutex::try_node attempt;
-  expect(!mutex.try_lock(attempt), "try_lock while lock held");
-  mutex.unlock(held);
-  if (mutex.try_lock(attempt)) {
-    mutex.unlock(attempt);
+  mutex.lock();
+  expect(!mutex.try_lock(), "try_lock while lock held");
+  mutex.unlock();
+  if (mutex.try_lock()) {
+    mutex.unlock();
   } else {
     expect(false, "try_lock after release");
   }
@@ -90,8 +81,7 @@ void test_lock_waits_for_try() {
   std::atomic<int> depth{0};
 
   std::thread holder([&] {
-    asf::queue_mutex::try_node node;
-    if (!mutex.try_lock(node)) {
+    if (!mutex.try_lock()) {
       expect(false, "holder try_lock");
       phase.store(1, std::memory_order_relaxed);
       return;
@@ -102,17 +92,16 @@ void test_lock_waits_for_try() {
     }
     const int seen = depth.load(std::memory_order_relaxed);
     expect(seen == 0, "lock entered before try unlock");
-    mutex.unlock(node);
+    mutex.unlock();
   });
 
   while (phase.load(std::memory_order_relaxed) < 1) {
     std::this_thread::yield();
   }
   std::thread waiter([&] {
-    asf::queue_mutex::lock_node node;
-    mutex.lock(node);
+    mutex.lock();
     depth.store(1, std::memory_order_relaxed);
-    mutex.unlock(node);
+    mutex.unlock();
   });
 
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -151,16 +140,14 @@ void worker_loop(asf::queue_mutex& mutex, std::atomic<bool>& stop, std::atomic<i
   while (!stop.load(std::memory_order_relaxed)) {
     rng = rng * 1664525u + 1013904223u;
     if ((rng % 16u) < 6u) {
-      asf::queue_mutex::lock_node node;
-      mutex.lock(node);
+      mutex.lock();
       hold(depth, entries);
-      mutex.unlock(node);
+      mutex.unlock();
     } else {
       try_attempts.fetch_add(1, std::memory_order_relaxed);
-      asf::queue_mutex::try_node node;
-      if (mutex.try_lock(node)) {
+      if (mutex.try_lock()) {
         hold(depth, entries);
-        mutex.unlock(node);
+        mutex.unlock();
       } else {
         try_failures.fetch_add(1, std::memory_order_relaxed);
       }
@@ -200,6 +187,8 @@ void test_churn() {
 
   int cursor = 0;
   std::int64_t previous = 0;
+  std::uint64_t previous_parks = asf::park_count();
+  std::uint64_t previous_park_ns = asf::park_ns();
   for (int sec = 1; sec <= kSeconds; ++sec) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
     for (int k = 0; k < kHalf; ++k) {
@@ -215,9 +204,15 @@ void test_churn() {
     const std::int64_t now = entries.load(std::memory_order_relaxed);
     const std::int64_t attempts = try_attempts.load(std::memory_order_relaxed);
     const std::int64_t failed = try_failures.load(std::memory_order_relaxed);
-    std::printf("sec %d entries %lld (+%lld) depth %d try %lld fail %lld\n", sec,
-                static_cast<long long>(now), static_cast<long long>(now - previous), depth.load(),
-                static_cast<long long>(attempts), static_cast<long long>(failed));
+    const std::uint64_t parks = asf::park_count();
+    const std::uint64_t parked_ns = asf::park_ns();
+    std::printf("sec %d entries %lld (+%lld) depth %d try %lld fail %lld parks +%llu park_ms %llu\n",
+                sec, static_cast<long long>(now), static_cast<long long>(now - previous),
+                depth.load(), static_cast<long long>(attempts), static_cast<long long>(failed),
+                static_cast<unsigned long long>(parks - previous_parks),
+                static_cast<unsigned long long>((parked_ns - previous_park_ns) / 1000000ull));
+    previous_parks = parks;
+    previous_park_ns = parked_ns;
     std::fflush(stdout);
     if (now == previous) {
       expect(false, "no progress in one second");
@@ -233,9 +228,8 @@ void test_churn() {
   expect(g_failures.load() == failures_before, "churn exclusion");
   expect_success_counters(entries.load(), "churn success counters");
 
-  asf::queue_mutex::lock_node tail;
-  mutex.lock(tail);
-  mutex.unlock(tail);
+  mutex.lock();
+  mutex.unlock();
 }
 
 void test_stress() {
@@ -254,16 +248,14 @@ void test_stress() {
       for (int i = 0; i < kIters; ++i) {
         rng = rng * 1664525u + 1013904223u;
         if ((rng % 16u) < 6u) {
-          asf::queue_mutex::lock_node node;
-          mutex.lock(node);
+          mutex.lock();
           hold(depth, entries);
-          mutex.unlock(node);
+          mutex.unlock();
         } else {
           try_attempts.fetch_add(1, std::memory_order_relaxed);
-          asf::queue_mutex::try_node node;
-          if (mutex.try_lock(node)) {
+          if (mutex.try_lock()) {
             hold(depth, entries);
-            mutex.unlock(node);
+            mutex.unlock();
           } else {
             try_failures.fetch_add(1, std::memory_order_relaxed);
           }
@@ -281,48 +273,23 @@ void test_stress() {
               static_cast<long long>(try_failures.load()));
   expect_success_counters(entries.load(), "stress success counters");
 
-  asf::queue_mutex::lock_node tail;
-  mutex.lock(tail);
-  mutex.unlock(tail);
-}
-
-void test_tls() {
-  asf::queue_mutex mutex;
-  mutex.lock();
-  mutex.unlock_lock();
   mutex.lock();
   mutex.unlock();
-  if (mutex.try_lock()) {
-    mutex.unlock_try();
+}
+
+void test_mixed() {
+  asf::queue_mutex mutex;
+  mutex.lock();
+  mutex.unlock();
+  if (!mutex.try_lock()) {
+    expect(false, "uncontended try_lock");
   } else {
-    expect(false, "tls direct try_lock");
-  }
-  if (mutex.try_lock()) {
     mutex.unlock();
-  } else {
-    expect(false, "tls uncontended try_lock");
   }
 
-  {
-    asf::queue_mutex::lock_node held;
-    mutex.lock(held);
-    expect(!mutex.try_lock(), "tls try_lock while lock held");
-    mutex.unlock(held);
-  }
-
-  {
-    asf::queue_mutex::lock_node node;
-    mutex.lock(node);
-    mutex.unlock(node);
-  }
-  {
-    asf::queue_mutex::try_node node;
-    if (mutex.try_lock(node)) {
-      mutex.unlock(node);
-    } else {
-      expect(false, "static node try_lock");
-    }
-  }
+  mutex.lock();
+  expect(!mutex.try_lock(), "try_lock while lock held");
+  mutex.unlock();
 
   constexpr int kThreads = 4;
   constexpr int kIters = 400;
@@ -357,7 +324,7 @@ void test_tls() {
   }
   const int count = relaxed.value.load(std::memory_order_relaxed);
   if (plain.value != count || count == 0) {
-    std::fprintf(stderr, "FAIL tls counters plain %d relaxed %d\n", plain.value, count);
+    std::fprintf(stderr, "FAIL mixed counters plain %d relaxed %d\n", plain.value, count);
     g_failures.fetch_add(1, std::memory_order_relaxed);
   }
 }
@@ -367,8 +334,7 @@ void test_tls() {
 void test_lock_os_park() {
   const std::uint64_t parks_before = asf::park_count();
   asf::queue_mutex mutex;
-  asf::queue_mutex::lock_node held;
-  mutex.lock(held);
+  mutex.lock();
 
   constexpr int kThreads = 64;
   std::atomic<int> ready{0};
@@ -378,10 +344,9 @@ void test_lock_os_park() {
   for (int i = 0; i < kThreads; ++i) {
     threads.emplace_back([&] {
       ready.fetch_add(1, std::memory_order_relaxed);
-      asf::queue_mutex::lock_node node;
-      mutex.lock(node);
+      mutex.lock();
       entered.fetch_add(1, std::memory_order_relaxed);
-      mutex.unlock(node);
+      mutex.unlock();
     });
   }
   while (ready.load(std::memory_order_relaxed) < kThreads) {
@@ -395,7 +360,7 @@ void test_lock_os_park() {
               static_cast<unsigned long long>(parks));
   std::fflush(stdout);
 
-  mutex.unlock(held);
+  mutex.unlock();
   for (auto& thread : threads) {
     thread.join();
   }
@@ -408,7 +373,7 @@ int main() {
   test_uncontended();
   test_try_fails_while_held();
   test_lock_waits_for_try();
-  test_tls();
+  test_mixed();
   test_lock_os_park();
   test_stress();
   test_churn();

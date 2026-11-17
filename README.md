@@ -1,6 +1,8 @@
 # asf::queue_mutex
 
-C++17 header-only mutex for a fair user-space `lock` / `try_lock`, This has an extra performance cost. `lock` takes the mutex in queue order. `try_lock` fails in order, and `lock` does not affect that order. The mutex allocates nothing and keeps no pre-sized table: the node for a call lives on the caller's stack, or in the one thread-local slot.
+C++17 header-only mutex for a fair user-space `lock` / `try_lock`. Fairness has an extra performance cost. `lock` takes the mutex in queue order. `try_lock` fails in its own queue order, and a `lock` does not take a turn in that queue. The mutex allocates nothing: the node for a contended call lives on the caller's stack and is gone when the call returns.
+
+`unlock` only clears the owner. A contended `lock` hands its queue role to the successor before it returns into the critical section.
 
 ## Layout
 
@@ -17,52 +19,21 @@ C++17 header-only mutex for a fair user-space `lock` / `try_lock`, This has an e
 
 asf::queue_mutex mutex;
 
-void lock_stack() {
-  asf::queue_mutex::lock_node node;
-  mutex.lock(node);
-  mutex.unlock(node);
-}
-
-void lock_tls() {
-  mutex.lock();
-  mutex.unlock_lock();
+void exclusive() {
   mutex.lock();
   mutex.unlock();
 }
-```
 
-`try_lock(try_node&)` is released with `unlock(try_node&)`. The node stays alive until that call returns.
-
-`lock()` and `try_lock()` take no node. Both use one `thread_local` slot per thread, shared by every `queue_mutex`. Three TLS unlocks:
-
-- `unlock_try()` calls `unlock(try_node&)` on that slot.
-- `unlock_lock()` calls `unlock(lock_node&)` on that slot.
-- `unlock()` calls whichever of those the slot holds.
-
-Calling `unlock_try()` or `unlock_lock()` for the other node is undefined.
-
-```cpp
-void try_node_unlock() {
-  asf::queue_mutex::try_node attempt;
-  if (mutex.try_lock(attempt)) {
-    mutex.unlock(attempt);
-  }
-}
-
-void try_tls_direct() {
-  if (mutex.try_lock()) {
-    mutex.unlock_try();
-  }
-}
-
-void try_tls() {
+void maybe() {
   if (mutex.try_lock()) {
     mutex.unlock();
   }
 }
 ```
 
-Nodes are not copyable. The mutex is not recursive. The `try_lock` head polls `ASF_TRY_SPIN` times and then gives up. A later call waits until it becomes the head. The default is 256. Override it with `-DASF_TRY_SPIN=N`.
+The mutex is not recursive. An uncontended `lock` is one CAS and builds no node. A contended `lock` waits on a stack node. After `ASF_LOCK_SPIN` relaxes it parks in the OS. The default is 512. On Windows the park call has its own pause loop, and `ASF_LOCK_PARK_SPIN` (256) is deducted from that budget. Elsewhere the deduction is 0.
+
+The `try_lock` head polls `ASF_TRY_SPIN` times and then gives up. A later call waits until it becomes the head, so the budget is part of the failure order. A waiter that reaches the same budget marks itself timed out. One waker releases that run and stops at the first node that has not timed out. The default is 256. Override either budget with `-DASF_TRY_SPIN=N` or `-DASF_LOCK_SPIN=N`.
 
 ## Build
 
@@ -73,15 +44,15 @@ cmake -S . -B build
 cmake --build build
 ```
 
-`test_queue_mutex` is built with `ASF_TRY_SPIN=0`. `bench_mutex` keeps the default budget of 256. GCC and Clang build both with `-Ofast -Wall -Wextra`. MinGW also links `-static`.
+`test_queue_mutex` is built with `ASF_TRY_SPIN=0`, `ASF_LOCK_SPIN=0`, and `ASF_COUNT_PARK`. `bench_mutex` keeps the defaults, 256 try spins and 512 lock spins. GCC and Clang build both with `-Ofast -Wall -Wextra`. MinGW also links `-static`.
 
 GitHub Actions builds both targets and runs the correctness test on Linux with GCC and Clang, on macOS, and on Windows.
 
 The same flags without CMake:
 
 ```text
-g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -DASF_TRY_SPIN=0 -o test_queue_mutex.exe tests/test_queue_mutex.cpp
-g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -o bench_mutex.exe bench/bench_mutex.cpp
+g++ -std=c++17 -Ofast -Wall -Wextra -pthread -I include -DASF_TRY_SPIN=0 -DASF_LOCK_SPIN=0 -DASF_COUNT_PARK -o test_queue_mutex tests/test_queue_mutex.cpp
+g++ -std=c++17 -Ofast -Wall -Wextra -pthread -I include -o bench_mutex bench/bench_mutex.cpp
 ```
 
 The correctness test's critical section is one `volatile` increment.
@@ -108,13 +79,15 @@ The correctness test's critical section is one `volatile` increment.
 +----------+   +----------+
 ```
 
-`meta` stays. It holds the tail of the `try_lock` queue, and it can carry a `lock` queue of its own. `try_lock` fails in the arrival order of its queue. A `lock` hanging under a `try_lock` is not in that queue. A node leaves its queue only from the head.
+`meta` holds the owner, the `try_lock` tail, and the claim index. `try_lock` nodes form that queue. `lock` nodes hang off the current `try_lock` tail, or off the lock tail once that subchain is closed. A `lock` under a `try_lock` is not in the `try_lock` failure order. A node leaves its queue only from the head.
 
 ---
 
 # asf::queue_mutex
 
-C++17 头文件互斥量，用来做公平的用户态 `lock` / `try_lock`，这有额外的性能成本。`lock` 按队列顺序获得锁。`try_lock` 会按顺序失败，这个顺序不受 `lock` 影响。互斥量不做动态分配，也没有预先配制的空间：一次调用的节点放在调用方栈上，或者放在那个线程本地槽里。
+C++17 头文件互斥量，用来做公平的用户态 `lock` / `try_lock`。公平有额外的性能成本。`lock` 按队列顺序获得锁。`try_lock` 按自己的队列顺序失败，`lock` 不占用这个顺序里的位置。互斥量不做动态分配：竞争调用的节点在调用方栈上，调用返回后就没有了。
+
+`unlock` 只清掉持有者。竞争的 `lock` 在返回进临界区之前，已经把队列角色交给了后继。
 
 ## 目录
 
@@ -131,52 +104,21 @@ C++17 头文件互斥量，用来做公平的用户态 `lock` / `try_lock`，这
 
 asf::queue_mutex mutex;
 
-void lock_stack() {
-  asf::queue_mutex::lock_node node;
-  mutex.lock(node);
-  mutex.unlock(node);
-}
-
-void lock_tls() {
-  mutex.lock();
-  mutex.unlock_lock();
+void exclusive() {
   mutex.lock();
   mutex.unlock();
 }
-```
 
-`try_lock(try_node&)` 用 `unlock(try_node&)` 释放。节点一直活到这次调用返回。
-
-`lock()` 和 `try_lock()` 都不接收节点。两者使用每个线程一个的 `thread_local` 槽，同一线程上所有 `queue_mutex` 共用。TLS 有三个解锁：
-
-- `unlock_try()` 对该槽调用 `unlock(try_node&)`。
-- `unlock_lock()` 对该槽调用 `unlock(lock_node&)`。
-- `unlock()` 调用槽里当前持有的那一个。
-
-对另一个节点调用 `unlock_try()` 或 `unlock_lock()` 是未定义行为。
-
-```cpp
-void try_node_unlock() {
-  asf::queue_mutex::try_node attempt;
-  if (mutex.try_lock(attempt)) {
-    mutex.unlock(attempt);
-  }
-}
-
-void try_tls_direct() {
-  if (mutex.try_lock()) {
-    mutex.unlock_try();
-  }
-}
-
-void try_tls() {
+void maybe() {
   if (mutex.try_lock()) {
     mutex.unlock();
   }
 }
 ```
 
-节点不可复制。互斥量不递归。`try_lock` 的队头轮询 `ASF_TRY_SPIN` 次后放弃，后来的调用等到自己变成队头。默认 256，编译时用 `-DASF_TRY_SPIN=N` 覆盖。
+互斥量不递归。无竞争的 `lock` 是一次 CAS，不建节点。有竞争的 `lock` 在栈节点上等待，`ASF_LOCK_SPIN` 次放松后转入操作系统停车。默认 512。Windows 的停车调用自带一段 pause，`ASF_LOCK_PARK_SPIN`（256）会从这份预算里扣掉。其他平台扣 0。
+
+`try_lock` 的队头轮询 `ASF_TRY_SPIN` 次后放弃。后来的调用等到自己变成队头，这份预算属于失败顺序。等待者达到同一预算后把自己标成超时。一个唤醒者连续放行这段超时节点，遇到第一个还没超时的就停。默认 256。编译时用 `-DASF_TRY_SPIN=N` 或 `-DASF_LOCK_SPIN=N` 覆盖。
 
 ## 编译
 
@@ -187,15 +129,15 @@ cmake -S . -B build
 cmake --build build
 ```
 
-`test_queue_mutex` 使用 `ASF_TRY_SPIN=0`。`bench_mutex` 保持默认的 256 次自旋。GCC 和 Clang 对这两个目标使用 `-Ofast -Wall -Wextra`。MinGW 再链接 `-static`。
+`test_queue_mutex` 使用 `ASF_TRY_SPIN=0`、`ASF_LOCK_SPIN=0` 和 `ASF_COUNT_PARK`。`bench_mutex` 保持默认，try 自旋 256 次，lock 自旋 512 次。GCC 和 Clang 对这两个目标使用 `-Ofast -Wall -Wextra`。MinGW 再链接 `-static`。
 
 GitHub Actions 会编译这两个目标，并在 Linux（GCC、Clang）、macOS 和 Windows 上跑正确性测试。
 
 不用 CMake 时是同一组选项：
 
 ```text
-g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -DASF_TRY_SPIN=0 -o test_queue_mutex.exe tests/test_queue_mutex.cpp
-g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -o bench_mutex.exe bench/bench_mutex.cpp
+g++ -std=c++17 -Ofast -Wall -Wextra -pthread -I include -DASF_TRY_SPIN=0 -DASF_LOCK_SPIN=0 -DASF_COUNT_PARK -o test_queue_mutex tests/test_queue_mutex.cpp
+g++ -std=c++17 -Ofast -Wall -Wextra -pthread -I include -o bench_mutex bench/bench_mutex.cpp
 ```
 
 正确性测试的临界区只有一次 `volatile` 加法。
@@ -222,4 +164,4 @@ g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -o bench_mutex.e
 +----------+   +----------+
 ```
 
-`meta` 一直在。它握着 `try_lock` 队列的尾，自己也可以带一条 `lock`。`try_lock` 按自己那条队列的到达顺序失败。挂在 `try_lock` 下面的 `lock` 不在这条队列里。节点只从自己队列的头离开。
+`meta` 握着持有者、`try_lock` 队列的尾，以及领取用的 index。`try_lock` 节点排成这条队列。`lock` 挂在当前 `try_lock` 的尾上，子链关闭后改挂到 lock 队列的尾上。挂在 `try_lock` 下面的 `lock` 不在 `try_lock` 的失败顺序里。节点只从自己队列的头离开。
