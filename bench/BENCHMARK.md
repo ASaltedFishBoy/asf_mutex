@@ -1,11 +1,11 @@
 # queue_mutex and std::mutex
 
-Measured on 2026-11-17. The machine is an Intel Core i7-14700 (20 cores, 28 logical processors). The compiler is MinGW-W64 g++ 16.2.0.
+Measured on 2026-11-18. The machine is an Intel Core i7-14700 (20 cores, 28 logical processors: 8 P-cores with hyperthreading plus 12 E-cores). The compiler is MinGW-W64 g++ 16.2.0.
 
 The correctness test and the benchmark share the same optimization flags:
 
 ```text
-g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -DASF_TRY_SPIN=0 -o test_queue_mutex.exe tests/test_queue_mutex.cpp
+g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -DASF_TRY_SPIN=0 -DASF_LOCK_SPIN=0 -DASF_COUNT_PARK -o test_queue_mutex.exe tests/test_queue_mutex.cpp
 g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -o bench_mutex.exe bench/bench_mutex.cpp
 ```
 
@@ -20,56 +20,54 @@ Two critical sections:
 - `inc`: add 1 to a thread-private integer.
 - `burn64`: 64 `volatile` additions. `-Ofast` cannot delete those accesses.
 
-Three lock implementations:
+Two lock implementations:
 
 - `std::mutex`: `lock` / `unlock`.
-- `queue_mutex stack`: a stack `lock_node` on every operation, then `lock(node)` / `unlock(node)`.
-- `queue_mutex tls`: `lock()` / `unlock()` with no node. The node lives in the thread-local slot, and each `lock()` constructs it in place.
+- `queue_mutex`: `lock()` / `unlock()`. A contended call builds its node on the caller's stack.
 
 ## Results
 
 | Threads | Implementation | inc ns/op | inc Mop/s | burn64 ns/op | burn64 Mop/s |
 | ---: | --- | ---: | ---: | ---: | ---: |
-| 1 | std::mutex | 13.1 | 76.43 | 84.2 | 11.87 |
-| 1 | queue_mutex stack | 25.2 | 39.65 | 75.3 | 13.29 |
-| 1 | queue_mutex tls | 32.2 | 31.09 | 76.0 | 13.16 |
-| 2 | std::mutex | 30.2 | 33.14 | 151.6 | 6.60 |
-| 2 | queue_mutex stack | 95.3 | 10.49 | 161.3 | 6.20 |
-| 2 | queue_mutex tls | 89.8 | 11.14 | 163.1 | 6.13 |
-| 4 | std::mutex | 29.5 | 33.86 | 134.0 | 7.46 |
-| 4 | queue_mutex stack | 96.2 | 10.40 | 175.5 | 5.70 |
-| 4 | queue_mutex tls | 97.4 | 10.27 | 169.0 | 5.92 |
-| 8 | std::mutex | 48.6 | 20.58 | 162.1 | 6.17 |
-| 8 | queue_mutex stack | 107.1 | 9.33 | 195.3 | 5.12 |
-| 8 | queue_mutex tls | 113.3 | 8.83 | 197.5 | 5.06 |
-| 16 | std::mutex | 62.7 | 15.94 | 203.2 | 4.92 |
-| 16 | queue_mutex stack | 123.7 | 8.08 | 199.7 | 5.01 |
-| 16 | queue_mutex tls | 125.5 | 7.97 | 201.6 | 4.96 |
+| 1 | std::mutex | 12.3 | 81.37 | 83.8 | 11.93 |
+| 1 | queue_mutex | 12.9 | 77.79 | 79.4 | 12.59 |
+| 2 | std::mutex | 32.2 | 31.05 | 130.1 | 7.69 |
+| 2 | queue_mutex | 96.8 | 10.33 | 229.5 | 4.36 |
+| 4 | std::mutex | 28.0 | 35.71 | 134.2 | 7.45 |
+| 4 | queue_mutex | 119.7 | 8.35 | 167.2 | 5.98 |
+| 8 | std::mutex | 46.5 | 21.51 | 140.6 | 7.11 |
+| 8 | queue_mutex | 124.4 | 8.04 | 187.9 | 5.32 |
+| 16 | std::mutex | 64.0 | 15.62 | 155.7 | 6.42 |
+| 16 | queue_mutex | 151.4 | 6.61 | 243.0 | 4.12 |
+| 28 | std::mutex | 63.5 | 15.75 | 237.3 | 4.21 |
+| 28 | queue_mutex | 188.8 | 5.30 | 311.8 | 3.21 |
 
-With one integer increment in the critical section, `std::mutex` is faster. One thread takes about 13 ns. The stack-node interface takes about 25 ns, and the TLS interface about 32 ns. At 16 threads the standard library takes about 63 ns, and this mutex about 124–126 ns.
+With one integer increment in the critical section, `std::mutex` is faster; that gap is the price of queue fairness plus a `try_lock` with its own queue order. One thread is even (about 13 ns either way), and from 2 to 28 threads the ratio stays a fairly constant 2–3x. The important part is what is absent: throughput does not collapse at or above the core count. 28 threads on 28 logical processors hold 188.8 ns/op next to 151.4 at 16 threads — earlier revisions of this mutex fell into a park convoy past the physical core count and were over 40x slower there.
 
-With 64 `volatile` additions, the critical section covers most of the lock overhead. At one thread the stack-node interface takes 75 ns and the standard library 84 ns. At 16 threads both sit around 200 ns.
+With 64 `volatile` additions, the critical section covers most of the lock overhead. At one thread the two are even (79 vs 84 ns), and at 28 threads they sit at 312 vs 237 ns.
+
+The waiting policy that keeps oversubscription flat: a contended `lock` spins for `ASF_LOCK_SPIN` pauses (default 2048, about 85 µs — sized to outlast one scheduling jitter, because a jitter longer than the budget ignites a self-sustaining park convoy). When the budget runs out without a grant, the waiter yields the core up to 12 times, respinning if a handoff completes, and only then parks. And when a grant finds its target parked, the unlock marks up to 8 further queued nodes head — one per ~1 µs of the last observed grant gap — so wake latency is pipelined across upcoming turns instead of paid serially per handoff. All three mechanisms are idle in the fast lane.
 
 ## Correctness test
 
-The correctness test is built with `-DASF_TRY_SPIN=0`. The critical section and the gap between operations are each one `volatile` increment, a few nanoseconds. The performance table above keeps the default budget of 256 spins.
+The correctness test is built with `-DASF_TRY_SPIN=0 -DASF_LOCK_SPIN=0 -DASF_COUNT_PARK`, so every wait exercises the OS park path. The performance table above uses the default budgets.
 
 `test_queue_mutex.exe` passed with exit code 0.
 
-- stress: 15000 `try_lock` calls, 7880 failures, about 53%.
-- 60 seconds with 64 threads: 15957188 `try_lock` calls, 10151638 failures, about 64%. Threads entered the critical section 15379997 times, about 256,000 times per second.
+- stress: 15000 `try_lock` calls, 13651 failures, about 91%.
+- 60 seconds with 64 threads: 28749556 `try_lock` calls, 28748684 failures; threads entered the critical section 17251540 times, about 287,500 times per second. Roughly 291,000 parks per second, expected with zeroed spin budgets.
 - The plain counter and the relaxed atomic counter match. Depth is 0 at the end.
 
 ---
 
 # queue_mutex 与 std::mutex
 
-测量日期 2026-11-17。机器是 Intel Core i7-14700（20 核、28 逻辑处理器）。编译器是 MinGW-W64 g++ 16.2.0。
+测量日期 2026-11-18。机器是 Intel Core i7-14700（20 核、28 逻辑处理器：8 个支持超线程的 P 核加 12 个 E 核）。编译器是 MinGW-W64 g++ 16.2.0。
 
 功能和性能都用同一组优化选项：
 
 ```text
-g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -DASF_TRY_SPIN=0 -o test_queue_mutex.exe tests/test_queue_mutex.cpp
+g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -DASF_TRY_SPIN=0 -DASF_LOCK_SPIN=0 -DASF_COUNT_PARK -o test_queue_mutex.exe tests/test_queue_mutex.cpp
 g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -o bench_mutex.exe bench/bench_mutex.cpp
 ```
 
@@ -84,42 +82,40 @@ g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -o bench_mutex.e
 - `inc`：临界区里对线程私有整数加 1。
 - `burn64`：临界区里做 64 次 `volatile` 累加。`-Ofast` 消不掉这些访问。
 
-三种加锁方式：
+两种加锁方式：
 
 - `std::mutex`：`lock` / `unlock`。
-- `queue_mutex stack`：每次在栈上放一个 `lock_node`，调用 `lock(node)` / `unlock(node)`。
-- `queue_mutex tls`：调用不带节点的 `lock()` / `unlock()`。节点放在线程本地槽里，每次 `lock()` 都会就地构造。
+- `queue_mutex`：`lock()` / `unlock()`。竞争调用在调用方栈上建节点。
 
 ## 结果
 
 | 线程 | 实现 | inc ns/op | inc Mop/s | burn64 ns/op | burn64 Mop/s |
 | ---: | --- | ---: | ---: | ---: | ---: |
-| 1 | std::mutex | 13.1 | 76.43 | 84.2 | 11.87 |
-| 1 | queue_mutex stack | 25.2 | 39.65 | 75.3 | 13.29 |
-| 1 | queue_mutex tls | 32.2 | 31.09 | 76.0 | 13.16 |
-| 2 | std::mutex | 30.2 | 33.14 | 151.6 | 6.60 |
-| 2 | queue_mutex stack | 95.3 | 10.49 | 161.3 | 6.20 |
-| 2 | queue_mutex tls | 89.8 | 11.14 | 163.1 | 6.13 |
-| 4 | std::mutex | 29.5 | 33.86 | 134.0 | 7.46 |
-| 4 | queue_mutex stack | 96.2 | 10.40 | 175.5 | 5.70 |
-| 4 | queue_mutex tls | 97.4 | 10.27 | 169.0 | 5.92 |
-| 8 | std::mutex | 48.6 | 20.58 | 162.1 | 6.17 |
-| 8 | queue_mutex stack | 107.1 | 9.33 | 195.3 | 5.12 |
-| 8 | queue_mutex tls | 113.3 | 8.83 | 197.5 | 5.06 |
-| 16 | std::mutex | 62.7 | 15.94 | 203.2 | 4.92 |
-| 16 | queue_mutex stack | 123.7 | 8.08 | 199.7 | 5.01 |
-| 16 | queue_mutex tls | 125.5 | 7.97 | 201.6 | 4.96 |
+| 1 | std::mutex | 12.3 | 81.37 | 83.8 | 11.93 |
+| 1 | queue_mutex | 12.9 | 77.79 | 79.4 | 12.59 |
+| 2 | std::mutex | 32.2 | 31.05 | 130.1 | 7.69 |
+| 2 | queue_mutex | 96.8 | 10.33 | 229.5 | 4.36 |
+| 4 | std::mutex | 28.0 | 35.71 | 134.2 | 7.45 |
+| 4 | queue_mutex | 119.7 | 8.35 | 167.2 | 5.98 |
+| 8 | std::mutex | 46.5 | 21.51 | 140.6 | 7.11 |
+| 8 | queue_mutex | 124.4 | 8.04 | 187.9 | 5.32 |
+| 16 | std::mutex | 64.0 | 15.62 | 155.7 | 6.42 |
+| 16 | queue_mutex | 151.4 | 6.61 | 243.0 | 4.12 |
+| 28 | std::mutex | 63.5 | 15.75 | 237.3 | 4.21 |
+| 28 | queue_mutex | 188.8 | 5.30 | 311.8 | 3.21 |
 
-临界区只有一次整数加法时，`std::mutex` 更快。单线程大约 13 ns，栈节点接口大约 25 ns，TLS 接口大约 32 ns。16 线程时标准库大约 63 ns，本实现大约 124–126 ns。
+临界区只有一次整数加法时，`std::mutex` 更快；这个差距就是公平队列加一个自带失败顺序的 `try_lock` 的代价。单线程打平（都约 13 ns），2 到 28 线程差距稳定在 2–3 倍。关键在于缺了什么：超过核数之后吞吐不再崩塌。28 个线程跑满 28 个逻辑处理器时是 188.8 ns/op，和 16 线程的 151.4 相邻——本互斥量的早期版本在超过物理核数后会陷入停车车队，在那里要慢 40 倍以上。
 
-临界区改成 64 次 `volatile` 累加后，临界区盖住了锁开销的大部分。单线程时栈节点接口是 75 ns，标准库是 84 ns。16 线程时两者都在 200 ns 左右。
+临界区改成 64 次 `volatile` 累加后，临界区盖住了锁开销的大部分。单线程两者打平（79 对 84 ns），28 线程时是 312 对 237 ns。
+
+让超订保持平坦的等待策略：竞争的 `lock` 自旋 `ASF_LOCK_SPIN` 次（默认 2048，约 85 µs——按扛住一次调度抖动来定，因为比预算长的抖动会点燃自我维持的停车车队）。预算耗尽仍未获授权时，等待者先让核最多 12 次，期间若有交接完成就重新自旋，然后才停车。而当授权发现目标在停车时，`unlock` 会把队列里更多节点标成待命队头——按上次实测授权间隔每 ~1 µs 一个、最多 8 个——把唤醒延迟摊到未来若干棒上流水化，而不是每次交接串行付一次。这三套机制在快车道里全部空转。
 
 ## 功能测试
 
-正确性测试用 `-DASF_TRY_SPIN=0` 编译。临界区里和两次操作之间各做一次 `volatile` 加法，停在几纳秒。上面的性能表仍是默认 256 次自旋。
+正确性测试用 `-DASF_TRY_SPIN=0 -DASF_LOCK_SPIN=0 -DASF_COUNT_PARK` 编译，每次等待都走操作系统停车路径。上面的性能表用默认预算。
 
 `test_queue_mutex.exe` 通过，退出码 0。
 
-- stress：15000 次 `try_lock`，失败 7880 次，约 53%。
-- 60 秒、64 线程混跑：15957188 次 `try_lock`，失败 10151638 次，约 64%。成功进入临界区 15379997 次，大约每秒 25.6 万次。
+- stress：15000 次 `try_lock`，失败 13651 次，约 91%。
+- 60 秒、64 线程混跑：28749556 次 `try_lock`，失败 28748684 次。成功进入临界区 17251540 次，大约每秒 28.75 万次。每秒约 29.1 万次停车，预算归零后属预期。
 - 非原子计数与 relaxed 原子计数一致。结束时深度为 0。

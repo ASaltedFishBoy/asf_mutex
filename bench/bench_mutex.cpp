@@ -106,7 +106,7 @@ Sample bench_queue(int threads, Hold hold) {
 
 template <typename Hold>
 void sweep(const char* work, Hold hold) {
-  const int threads[] = {1, 2, 4, 8, 16};
+  const int threads[] = {1, 2, 4, 8, 16, 28};
   for (int n : threads) {
     report("std::mutex", n, work, bench_std(n, hold));
     report("queue_mutex", n, work, bench_queue(n, hold));
