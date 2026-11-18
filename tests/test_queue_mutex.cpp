@@ -150,21 +150,31 @@ void hold(std::atomic<int>& depth, std::atomic<std::int64_t>& entries) {
 
 void worker_loop(asf::queue_mutex& mutex, std::atomic<bool>& stop, std::atomic<int>& depth,
                 std::atomic<std::int64_t>& entries, std::atomic<std::int64_t>& try_attempts,
-                std::atomic<std::int64_t>& try_failures, unsigned seed) {
+                std::atomic<std::int64_t>& try_failures, std::atomic<std::int64_t>& fair_attempts,
+                std::atomic<std::int64_t>& fair_failures, unsigned seed) {
   unsigned rng = seed;
   while (!stop.load(std::memory_order_relaxed)) {
     rng = rng * 1664525u + 1013904223u;
-    if ((rng % 16u) < 6u) {
+    const unsigned pick = rng % 16u;
+    if (pick < 6u) {
       mutex.lock();
       hold(depth, entries);
       mutex.unlock();
-    } else {
+    } else if (pick < 11u) {
       try_attempts.fetch_add(1, std::memory_order_relaxed);
-      if (mutex.fair_try_lock()) {
+      if (mutex.try_lock()) {
         hold(depth, entries);
         mutex.unlock();
       } else {
         try_failures.fetch_add(1, std::memory_order_relaxed);
+      }
+    } else {
+      fair_attempts.fetch_add(1, std::memory_order_relaxed);
+      if (mutex.fair_try_lock()) {
+        hold(depth, entries);
+        mutex.unlock();
+      } else {
+        fair_failures.fetch_add(1, std::memory_order_relaxed);
       }
     }
     dwell();
@@ -180,6 +190,8 @@ void test_churn() {
   std::atomic<std::int64_t> entries{0};
   std::atomic<std::int64_t> try_attempts{0};
   std::atomic<std::int64_t> try_failures{0};
+  std::atomic<std::int64_t> fair_attempts{0};
+  std::atomic<std::int64_t> fair_failures{0};
   const int failures_before = g_failures.load(std::memory_order_relaxed);
 
   struct Worker {
@@ -193,7 +205,7 @@ void test_churn() {
     Worker* raw = worker.get();
     raw->thread = std::thread(worker_loop, std::ref(mutex), std::ref(raw->stop), std::ref(depth),
                               std::ref(entries), std::ref(try_attempts), std::ref(try_failures),
-                              seed++);
+                              std::ref(fair_attempts), std::ref(fair_failures), seed++);
     workers[index] = std::move(worker);
   };
   for (int i = 0; i < kLive; ++i) {
@@ -219,13 +231,17 @@ void test_churn() {
     const std::int64_t now = entries.load(std::memory_order_relaxed);
     const std::int64_t attempts = try_attempts.load(std::memory_order_relaxed);
     const std::int64_t failed = try_failures.load(std::memory_order_relaxed);
+    const std::int64_t fair = fair_attempts.load(std::memory_order_relaxed);
+    const std::int64_t fair_failed = fair_failures.load(std::memory_order_relaxed);
     const std::uint64_t parks = asf::park_count();
     const std::uint64_t parked_ns = asf::park_ns();
-    std::printf("sec %d entries %lld (+%lld) depth %d try %lld fail %lld parks +%llu park_ms %llu\n",
-                sec, static_cast<long long>(now), static_cast<long long>(now - previous),
-                depth.load(), static_cast<long long>(attempts), static_cast<long long>(failed),
-                static_cast<unsigned long long>(parks - previous_parks),
-                static_cast<unsigned long long>((parked_ns - previous_park_ns) / 1000000ull));
+    std::printf(
+        "sec %d entries %lld (+%lld) depth %d try %lld fail %lld fair %lld ffail %lld parks +%llu park_ms %llu\n",
+        sec, static_cast<long long>(now), static_cast<long long>(now - previous), depth.load(),
+        static_cast<long long>(attempts), static_cast<long long>(failed),
+        static_cast<long long>(fair), static_cast<long long>(fair_failed),
+        static_cast<unsigned long long>(parks - previous_parks),
+        static_cast<unsigned long long>((parked_ns - previous_park_ns) / 1000000ull));
     previous_parks = parks;
     previous_park_ns = parked_ns;
     std::fflush(stdout);
@@ -255,6 +271,8 @@ void test_stress() {
   std::atomic<std::int64_t> entries{0};
   std::atomic<std::int64_t> try_attempts{0};
   std::atomic<std::int64_t> try_failures{0};
+  std::atomic<std::int64_t> fair_attempts{0};
+  std::atomic<std::int64_t> fair_failures{0};
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
   for (int t = 0; t < kThreads; ++t) {
@@ -262,17 +280,26 @@ void test_stress() {
       unsigned rng = 0x9e3779b9u ^ static_cast<unsigned>(t * 17 + 1);
       for (int i = 0; i < kIters; ++i) {
         rng = rng * 1664525u + 1013904223u;
-        if ((rng % 16u) < 6u) {
+        const unsigned pick = rng % 16u;
+        if (pick < 6u) {
           mutex.lock();
           hold(depth, entries);
           mutex.unlock();
-        } else {
+        } else if (pick < 11u) {
           try_attempts.fetch_add(1, std::memory_order_relaxed);
-          if (mutex.fair_try_lock()) {
+          if (mutex.try_lock()) {
             hold(depth, entries);
             mutex.unlock();
           } else {
             try_failures.fetch_add(1, std::memory_order_relaxed);
+          }
+        } else {
+          fair_attempts.fetch_add(1, std::memory_order_relaxed);
+          if (mutex.fair_try_lock()) {
+            hold(depth, entries);
+            mutex.unlock();
+          } else {
+            fair_failures.fetch_add(1, std::memory_order_relaxed);
           }
         }
         dwell();
@@ -284,8 +311,11 @@ void test_stress() {
   }
   expect(depth.load() == 0, "depth drained");
   expect(entries.load() > 0, "stress made progress");
-  std::printf("stress try %lld fail %lld\n", static_cast<long long>(try_attempts.load()),
-              static_cast<long long>(try_failures.load()));
+  std::printf("stress try %lld fail %lld fair %lld ffail %lld\n",
+              static_cast<long long>(try_attempts.load()),
+              static_cast<long long>(try_failures.load()),
+              static_cast<long long>(fair_attempts.load()),
+              static_cast<long long>(fair_failures.load()));
   expect_success_counters(entries.load(), "stress success counters");
 
   mutex.lock();
@@ -321,12 +351,19 @@ void test_mixed() {
   for (int t = 0; t < kThreads; ++t) {
     threads.emplace_back([&, t] {
       for (int i = 0; i < kIters; ++i) {
-        if (((i + t) & 1) == 0) {
+        const int pick = (i + t) % 3;
+        if (pick == 0) {
           mutex.lock();
           ++plain.value;
           relaxed.value.fetch_add(1, std::memory_order_relaxed);
           mutex.unlock();
-        } else if (mutex.try_lock()) {
+        } else if (pick == 1) {
+          if (mutex.try_lock()) {
+            ++plain.value;
+            relaxed.value.fetch_add(1, std::memory_order_relaxed);
+            mutex.unlock();
+          }
+        } else if (mutex.fair_try_lock()) {
           ++plain.value;
           relaxed.value.fetch_add(1, std::memory_order_relaxed);
           mutex.unlock();

@@ -54,8 +54,8 @@ The correctness test is built with `-DASF_TRY_SPIN=0 -DASF_LOCK_SPIN=0 -DASF_COU
 
 `test_queue_mutex.exe` passed with exit code 0.
 
-- stress: 15000 `fair_try_lock` calls, 13651 failures, about 91%.
-- 60 seconds with 64 threads: 28861294 `fair_try_lock` calls, 28860633 failures; threads entered the critical section 17318395 times, about 288,600 times per second. Roughly 291,000 parks per second, expected with zeroed spin budgets.
+- stress: 7500 `try_lock` calls, 6951 failures, and 7500 `fair_try_lock` calls, 6945 failures — about 93% each. The churn workers mix `lock`, one-shot `try_lock`, and queueing `fair_try_lock` roughly 6:5:5.
+- 60 seconds with 64 threads: 14300141 `try_lock` calls, 14299781 failures, and 14300873 `fair_try_lock` calls, 14300510 failures; threads entered the critical section 17162276 times, about 286,000 times per second. Roughly 291,000 parks per second, expected with zeroed spin budgets.
 - The plain counter and the relaxed atomic counter match. Depth is 0 at the end.
 
 ---
@@ -116,6 +116,6 @@ g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -o bench_mutex.e
 
 `test_queue_mutex.exe` 通过，退出码 0。
 
-- stress：15000 次 `fair_try_lock`，失败 13651 次，约 91%。
-- 60 秒、64 线程混跑：28861294 次 `fair_try_lock`，失败 28860633 次。成功进入临界区 17318395 次，大约每秒 28.86 万次。每秒约 29.1 万次停车，预算归零后属预期。
+- stress：7500 次 `try_lock`，失败 6951 次；7500 次 `fair_try_lock`，失败 6945 次——各约 93%。混跑 worker 按约 6:5:5 混合 `lock`、一次性 `try_lock` 和排队的 `fair_try_lock`。
+- 60 秒、64 线程混跑：14300141 次 `try_lock`，失败 14299781 次；14300873 次 `fair_try_lock`，失败 14300510 次。成功进入临界区 17162276 次，大约每秒 28.6 万次。每秒约 29.1 万次停车，预算归零后属预期。
 - 非原子计数与 relaxed 原子计数一致。结束时深度为 0。
