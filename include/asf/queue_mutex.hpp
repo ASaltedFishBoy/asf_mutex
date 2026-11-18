@@ -4,14 +4,15 @@
 // Each row below is one 64-bit CAS word: a 16-byte-aligned pointer in bits
 // [47:4], a 16-bit index in bits [63:48], and flags in bits [3:0].
 //
-// meta.state:     owner | try_tail | claim_index
-// meta.lock_tail: lock_index | lock_tail | splice bit
+// meta.state:      owner | try_tail | claim_index
+// meta.lock_tail:  lock_index | lock_tail | splice bit
+// meta.lock_front: next grant target, written by the holder at acquire
 //
 // try_node.link:    end_index | next try | released
 // try_node.segment: lock_index | lock_tail | closed
 // try_node.front:   begin_index | segment front
 //
-// lock_node.word:   parked | head | lock_index | next
+// lock_node.word:   parked | grant | head | lock_index | next
 // A node that saw a null tail already knows it is the head and keeps that in
 // a local. The head bit is only written into a successor that is waiting.
 // try unlock frees the owner; that head takes the mutex itself. The parked
@@ -20,8 +21,11 @@
 //
 // A node never keeps the tail it displaced. That pointer is used once, to
 // publish this node into its next word, and then dropped. Waiting is on
-// this node's own word. After a lock acquires, it hands the MCS queue role
-// to its successor (or swings the tail clear); unlock only clears state_.
+// this node's own word. After a lock acquires, it records its successor in
+// lock_front_ (or swings the tail clear) and its stack node dies unreferenced.
+// unlock grants lock_front_ (kGrant carries ownership itself, state_ stays
+// kLock through the whole handoff chain); only when the queue drained at
+// acquire time does unlock free state_ so a front polling there can CAS.
 
 #include <atomic>
 #include <cassert>
@@ -106,8 +110,9 @@ class queue_mutex {
   queue_mutex& operator=(const queue_mutex&) = delete;
 
   // Uncontended lock CAS-es state_ and never builds a node. Contended lock
-  // parks on a stack lock_node, then hands the MCS role to the successor
-  // before returning; unlock only clears state_.
+  // parks on a stack lock_node, then records the successor in lock_front_
+  // before returning; unlock grants that node, or frees state_ when the
+  // queue had drained at acquire time.
   void lock();
 
   // A successful try retires its stack try_node before returning. unlock only
@@ -119,7 +124,8 @@ class queue_mutex {
   void unlock();
 
  private:
-  struct alignas(16) lock_node {
+  // One cache line per spin tag: waiters never share a line with a neighbor.
+  struct alignas(64) lock_node {
     lock_node() = default;
     lock_node(const lock_node&) = delete;
     lock_node& operator=(const lock_node&) = delete;
@@ -137,6 +143,9 @@ class queue_mutex {
 
   static constexpr std::uint64_t kPtr = 0x0000FFFFFFFFFFF0ull;
   static constexpr std::uint64_t kHead = 0x2;
+  // kHead: you are the queue front, acquire by CAS-ing state_ owner.
+  // kGrant: ownership itself arrives with this bit; state_ stays kLock.
+  static constexpr std::uint64_t kGrant = 0x4;
   static constexpr std::uint64_t kParked = 0x1;
   static constexpr std::uint64_t kClosed = 0x1;
   static constexpr std::uint64_t kReleased = 0x1;
@@ -231,9 +240,17 @@ class queue_mutex {
     }
   }
 
+  // Ownership transfer proper: the bit alone makes the target the holder.
+  static void grant_node(lock_node& node) {
+    const std::uint64_t cur = node.word.fetch_or(kGrant, std::memory_order_relaxed);
+    if ((cur & kParked) != 0) {
+      wake_word(node.word);
+    }
+  }
+
   void lock_contended(lock_node& self);
   void wait_lock(lock_node& self, bool head);
-  void release_lock_node(lock_node& self);
+  void publish_successor(lock_node& self);
   bool try_lock_fast();
   bool try_lock_contended(try_node& self);
   bool join_segment(lock_node& self, try_node& owner, std::uint16_t index, std::uint16_t prev);
@@ -251,10 +268,18 @@ class queue_mutex {
   static void park_word(std::atomic<std::uint64_t>& word, std::uint64_t expected) noexcept;
   static void wake_word(std::atomic<std::uint64_t>& word) noexcept;
 
+  // Each meta word on its own line: join traffic (state_ bump + lock_tail_
+  // swap, by arrivals) and handoff traffic (lock_front_, by holder pairs)
+  // never share a cache line.
   // owner | try_tail | claim_index
-  std::atomic<std::uint64_t> state_{0};
+  alignas(64) std::atomic<std::uint64_t> state_{0};
   // lock_index | lock_tail | splice
-  std::atomic<std::uint64_t> lock_tail_{0};
+  alignas(64) std::atomic<std::uint64_t> lock_tail_{0};
+  // Grant target for the next unlock: written by the holder at acquire when
+  // a successor exists, consumed back to null by every unlock. Null whenever
+  // the lock queue is empty; in particular null while a try holds, so try
+  // unlock always takes the state_ path.
+  alignas(64) std::atomic<std::uint64_t> lock_front_{0};
 };
 
 inline void queue_mutex::pause() noexcept {
@@ -336,7 +361,13 @@ inline void queue_mutex::wake_word(std::atomic<std::uint64_t>& word) noexcept {
 #endif
 }
 
-inline void queue_mutex::release_lock_node(lock_node& self) {
+// Record the successor unlock should grant. Same lookup as the classic MCS
+// release (swing the tail clear when nobody follows); the pointer goes to
+// lock_front_ so the grant can happen at unlock time, after this stack node
+// died unreferenced. Nothing is stored when nobody follows: the previous
+// unlock already consumed lock_front_ back to null, so it is null exactly
+// when the queue is empty.
+inline void queue_mutex::publish_successor(lock_node& self) {
   std::uint64_t mine = self.word.load(std::memory_order_relaxed);
   lock_node* next = ptr_of<lock_node>(mine);
   if (next == nullptr) {
@@ -350,23 +381,30 @@ inline void queue_mutex::release_lock_node(lock_node& self) {
       relax(spins);
     }
   }
-  mark_head(*next);
+  lock_front_.store(ptr_bits(next), std::memory_order_relaxed);
 }
 
 inline void queue_mutex::wait_lock(lock_node& self, bool head) {
   std::uint32_t spins = 0;
   std::uint64_t word = self.word.load(std::memory_order_relaxed);
   for (;;) {
-    while (!head && (word & kHead) == 0 && spins < kLockSpin) {
+    while (!head && (word & (kHead | kGrant)) == 0 && spins < kLockSpin) {
       relax(spins);
       word = self.word.load(std::memory_order_relaxed);
     }
+    if ((word & kGrant) != 0) {
+      // The predecessor's unlock granted ownership with this bit; state_
+      // keeps owner=kLock the whole chain, nothing to CAS here.
+      publish_successor(self);
+      std::atomic_thread_fence(std::memory_order_acquire);
+      return;
+    }
     if (head || (word & kHead) != 0) {
-      // Head polls state_. try unlock frees the owner without touching this
-      // word, so parking here would miss the handoff.
+      // Front of a state_-driven queue: poll owner. try unlock frees the
+      // owner without touching this word, so parking here would miss it.
       std::uint64_t state = state_.load(std::memory_order_relaxed);
       if (owner_of(state) == kFree && cas(state_, state, with_owner(state, kLock))) {
-        release_lock_node(self);
+        publish_successor(self);
         std::atomic_thread_fence(std::memory_order_acquire);
         return;
       }
@@ -706,6 +744,18 @@ inline bool queue_mutex::try_lock() {
 
 inline void queue_mutex::unlock() {
   std::atomic_thread_fence(std::memory_order_release);
+  // Consume the target before granting: the granted successor stores its own
+  // successor here at its acquire, and that store must land after this one.
+  lock_node* next = ptr_of<lock_node>(lock_front_.exchange(0, std::memory_order_relaxed));
+  if (next != nullptr) {
+    // Steady-state handoff: the grant bit alone makes the successor the
+    // holder. state_ keeps owner=kLock; no meta word is written here.
+    grant_node(*next);
+    return;
+  }
+  // The queue had drained at acquire time (try holders always land here:
+  // lock_front_ is null whenever no lock node follows). A front that joined
+  // since polls state_, so ownership is released through the owner bits.
   std::uint64_t state = state_.load(std::memory_order_relaxed);
   ASF_CHECK(owner_of(state) == kTry || owner_of(state) == kLock);
   while (!cas(state_, state, with_owner(state, kFree))) {
