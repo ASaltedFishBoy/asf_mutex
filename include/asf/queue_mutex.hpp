@@ -366,7 +366,8 @@ inline void queue_mutex::wake_word(std::atomic<std::uint64_t>& word) noexcept {
 // lock_front_ so the grant can happen at unlock time, after this stack node
 // died unreferenced. Nothing is stored when nobody follows: the previous
 // unlock already consumed lock_front_ back to null, so it is null exactly
-// when the queue is empty.
+// when the queue is empty. The successor is marked head only when we never
+// parked ourselves (adaptive pre-wake, see below).
 inline void queue_mutex::publish_successor(lock_node& self) {
   std::uint64_t mine = self.word.load(std::memory_order_relaxed);
   lock_node* next = ptr_of<lock_node>(mine);
@@ -382,6 +383,15 @@ inline void queue_mutex::publish_successor(lock_node& self) {
     }
   }
   lock_front_.store(ptr_bits(next), std::memory_order_relaxed);
+  // Adaptive pre-wake. We never parked on our own wait (spin entry), so
+  // handoffs are cheap right now and the successor is likely spinning too:
+  // mark it head, it standby-polls, and unlock's grant reaches an awake
+  // thread. Had we been woken ourselves, the regime is slow; leave the
+  // successor on its own spin-then-park path rather than burn a core
+  // through our critical section.
+  if ((mine & kParked) == 0) {
+    mark_head(*next);
+  }
 }
 
 inline void queue_mutex::wait_lock(lock_node& self, bool head) {
