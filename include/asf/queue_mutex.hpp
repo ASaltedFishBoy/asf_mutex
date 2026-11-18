@@ -167,6 +167,10 @@ class queue_mutex {
   // On Windows, ASF_LOCK_PARK_SPIN is deducted for WaitOnAddress's own pause loop.
   static constexpr std::uint32_t kLockSpin =
       ASF_LOCK_SPIN > ASF_LOCK_PARK_SPIN ? ASF_LOCK_SPIN - ASF_LOCK_PARK_SPIN : 0;
+  // Yield allowance per wait, spent between an exhausted spin budget and an
+  // OS park: a descheduled holder gets this core before we pay a kernel wake
+  // for it. Bounded so a wait must reach the park after finite progress.
+  static constexpr std::uint32_t kYieldBridge = 12;
   static constexpr std::uint32_t kTry = 1;
   static constexpr std::uint32_t kLock = 2;
 
@@ -399,6 +403,7 @@ inline void queue_mutex::publish_successor(lock_node& self) {
 
 inline void queue_mutex::wait_lock(lock_node& self, bool head) {
   std::uint32_t spins = 0;
+  std::uint32_t yields = 0;
   std::uint64_t word = self.word.load(std::memory_order_relaxed);
   for (;;) {
     while (!head && (word & (kHead | kGrant)) == 0 && spins < kLockSpin) {
@@ -424,6 +429,26 @@ inline void queue_mutex::wait_lock(lock_node& self, bool head) {
       relax(spins);
       word = self.word.load(std::memory_order_relaxed);
       continue;
+    }
+    // Budget exhausted without a grant. Before paying a park, bridge a
+    // possibly descheduled holder: yield this core, respinning if the queue
+    // moves. With nothing runnable the yields are no-ops, so a merely long
+    // critical section is unaffected. The allowance is per wait, so progress
+    // cannot postpone the park forever.
+    if (!head && (word & (kHead | kGrant)) == 0 && yields < kYieldBridge) {
+      const std::uint64_t front = lock_front_.load(std::memory_order_relaxed);
+      while (yields < kYieldBridge && (word & (kHead | kGrant)) == 0) {
+        std::this_thread::yield();
+        ++yields;
+        word = self.word.load(std::memory_order_relaxed);
+        if (lock_front_.load(std::memory_order_relaxed) != front) {
+          spins = 0;
+          break;
+        }
+      }
+      if ((word & (kHead | kGrant)) != 0 || spins == 0) {
+        continue;
+      }
     }
     if ((word & kParked) == 0 && !cas(self.word, word, word | kParked)) {
       continue;
