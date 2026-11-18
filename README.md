@@ -1,6 +1,6 @@
 # asf::queue_mutex
 
-C++17 header-only mutex for a fair user-space `lock` / `try_lock`. Fairness has an extra performance cost. `lock` takes the mutex in queue order. `try_lock` fails in its own queue order, and a `lock` does not take a turn in that queue. The mutex allocates nothing: the node for a contended call lives on the caller's stack and is gone when the call returns.
+C++17 header-only mutex for a fair user-space `lock` / `fair_try_lock`. Fairness has an extra performance cost. `lock` takes the mutex in queue order. `fair_try_lock` fails in its own queue order, and a `lock` does not take a turn in that queue. A plain `try_lock` with the traditional one-shot semantics — no queue, no order, may fail spuriously — is also available. The mutex allocates nothing: the node for a contended call lives on the caller's stack and is gone when the call returns.
 
 `lock` records what its `unlock` should do in a meta word at acquire: the successor to grant, or nothing when the queue drained. `unlock` reads that record back — it is the holder's own store — and either grants the successor, the grant bit alone carrying ownership, or frees the owner word.
 
@@ -25,7 +25,13 @@ void exclusive() {
 }
 
 void maybe() {
-  if (mutex.try_lock()) {
+  if (mutex.try_lock()) {  // one-shot, no order, may fail spuriously
+    mutex.unlock();
+  }
+}
+
+void maybe_fair() {
+  if (mutex.fair_try_lock()) {  // fails in its own queue order
     mutex.unlock();
   }
 }
@@ -33,7 +39,7 @@ void maybe() {
 
 The mutex is not recursive. An uncontended `lock` is one CAS and builds no node. A contended `lock` waits on a stack node. After `ASF_LOCK_SPIN` relaxes — default 2048, about 85 µs, sized to outlast one scheduling jitter, since a jitter longer than the budget ignites a self-sustaining park convoy — it yields the core up to 12 times, respinning if a handoff completes, and only then parks in the OS. On Windows the park call has its own pause loop, and `ASF_LOCK_PARK_SPIN` (256) is deducted from that budget. Elsewhere the deduction is 0. When a grant finds its target parked, `unlock` also marks up to 8 further queued nodes head, one per ~1 µs of the last observed grant gap, pipelining wake latency across upcoming turns; this keeps throughput flat at and above the logical processor count.
 
-The `try_lock` head polls `ASF_TRY_SPIN` times and then gives up. A later call waits until it becomes the head, so the budget is part of the failure order. A waiter that reaches the same budget marks itself timed out. One waker releases that run and stops at the first node that has not timed out. The default is 256. Override either budget with `-DASF_TRY_SPIN=N` or `-DASF_LOCK_SPIN=N`.
+The `fair_try_lock` head polls `ASF_TRY_SPIN` times and then gives up. A later call waits until it becomes the head, so the budget is part of the failure order. A waiter that reaches the same budget marks itself timed out. One waker releases that run and stops at the first node that has not timed out. The default is 256. Override either budget with `-DASF_TRY_SPIN=N` or `-DASF_LOCK_SPIN=N`.
 
 ## Build
 
@@ -79,13 +85,13 @@ The correctness test's critical section is one `volatile` increment.
 +----------+   +----------+
 ```
 
-`meta` is three cache-line-separated words: the owner together with the `try_lock` tail and the claim index, the `lock` tail, and the grant slot the holder writes at acquire. `try_lock` nodes form that queue. `lock` nodes hang off the current `try_lock` tail, or off the lock tail once that subchain is closed. A `lock` under a `try_lock` is not in the `try_lock` failure order. A node leaves its queue only from the head.
+`meta` is three cache-line-separated words: the owner together with the `try_lock` tail and the claim index, the `lock` tail, and the grant slot the holder writes at acquire. `fair_try_lock` nodes form that queue. `lock` nodes hang off the current try tail, or off the lock tail once that subchain is closed. A `lock` under a `fair_try_lock` is not in the try failure order. A node leaves its queue only from the head.
 
 ---
 
 # asf::queue_mutex
 
-C++17 头文件互斥量，用来做公平的用户态 `lock` / `try_lock`。公平有额外的性能成本。`lock` 按队列顺序获得锁。`try_lock` 按自己的队列顺序失败，`lock` 不占用这个顺序里的位置。互斥量不做动态分配：竞争调用的节点在调用方栈上，调用返回后就没有了。
+C++17 头文件互斥量，用来做公平的用户态 `lock` / `fair_try_lock`。公平有额外的性能成本。`lock` 按队列顺序获得锁。`fair_try_lock` 按自己的队列顺序失败，`lock` 不占用这个顺序里的位置。另提供传统一次性语义的 `try_lock`：不排队、不占顺序、可能虚假失败。互斥量不做动态分配：竞争调用的节点在调用方栈上，调用返回后就没有了。
 
 `lock` 在获取时把 `unlock` 要做的事记进一个 meta 字：要授权的后继，或者队列已排空时的空记录。`unlock` 读回这份记录——那本来就是持有者自己存的——然后要么授权后继（授权位本身就带着所有权），要么释放持有者位。
 
@@ -110,7 +116,13 @@ void exclusive() {
 }
 
 void maybe() {
-  if (mutex.try_lock()) {
+  if (mutex.try_lock()) {  // 一次性，不占顺序，可能虚假失败
+    mutex.unlock();
+  }
+}
+
+void maybe_fair() {
+  if (mutex.fair_try_lock()) {  // 按自己的队列顺序失败
     mutex.unlock();
   }
 }
@@ -118,7 +130,7 @@ void maybe() {
 
 互斥量不递归。无竞争的 `lock` 是一次 CAS，不建节点。有竞争的 `lock` 在栈节点上等待，`ASF_LOCK_SPIN` 次放松后——默认 2048，约 85 µs，按扛住一次调度抖动来定，因为比预算长的抖动会点燃自我维持的停车车队——先让核最多 12 次，期间若有交接完成就重新自旋，然后才转入操作系统停车。Windows 的停车调用自带一段 pause，`ASF_LOCK_PARK_SPIN`（256）会从这份预算里扣掉。其他平台扣 0。授权发现目标在停车时，`unlock` 还会把队列里更多节点标成待命队头，按上次实测授权间隔每 ~1 µs 一个、最多 8 个，把唤醒延迟摊到未来几棒上流水化；这让吞吐在达到和超过逻辑核数时保持平坦。
 
-`try_lock` 的队头轮询 `ASF_TRY_SPIN` 次后放弃。后来的调用等到自己变成队头，这份预算属于失败顺序。等待者达到同一预算后把自己标成超时。一个唤醒者连续放行这段超时节点，遇到第一个还没超时的就停。默认 256。编译时用 `-DASF_TRY_SPIN=N` 或 `-DASF_LOCK_SPIN=N` 覆盖。
+`fair_try_lock` 的队头轮询 `ASF_TRY_SPIN` 次后放弃。后来的调用等到自己变成队头，这份预算属于失败顺序。等待者达到同一预算后把自己标成超时。一个唤醒者连续放行这段超时节点，遇到第一个还没超时的就停。默认 256。编译时用 `-DASF_TRY_SPIN=N` 或 `-DASF_LOCK_SPIN=N` 覆盖。
 
 ## 编译
 
@@ -164,4 +176,4 @@ g++ -std=c++17 -Ofast -Wall -Wextra -pthread -I include -o bench_mutex bench/ben
 +----------+   +----------+
 ```
 
-`meta` 是三个分处不同缓存行的字：持有者与 `try_lock` 队列尾、领取用的 index 同在一个字里，另两个分别是 `lock` 队列尾和持有者在获取时写入的授权槽。`try_lock` 节点排成这条队列。`lock` 挂在当前 `try_lock` 的尾上，子链关闭后改挂到 lock 队列的尾上。挂在 `try_lock` 下面的 `lock` 不在 `try_lock` 的失败顺序里。节点只从自己队列的头离开。
+`meta` 是三个分处不同缓存行的字：持有者与 `try_lock` 队列尾、领取用的 index 同在一个字里，另两个分别是 `lock` 队列尾和持有者在获取时写入的授权槽。`fair_try_lock` 节点排成这条队列。`lock` 挂在当前 try 队列的尾上，子链关闭后改挂到 lock 队列的尾上。挂在 `fair_try_lock` 下面的 `lock` 不在 try 的失败顺序里。节点只从自己队列的头离开。

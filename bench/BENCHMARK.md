@@ -42,7 +42,7 @@ Two lock implementations:
 | 28 | std::mutex | 63.5 | 15.75 | 237.3 | 4.21 |
 | 28 | queue_mutex | 188.8 | 5.30 | 311.8 | 3.21 |
 
-With one integer increment in the critical section, `std::mutex` is faster; that gap is the price of queue fairness plus a `try_lock` with its own queue order. One thread is even (about 13 ns either way), and from 2 to 28 threads the ratio stays a fairly constant 2–3x. The important part is what is absent: throughput does not collapse at or above the core count. 28 threads on 28 logical processors hold 188.8 ns/op next to 151.4 at 16 threads — earlier revisions of this mutex fell into a park convoy past the physical core count and were over 40x slower there.
+With one integer increment in the critical section, `std::mutex` is faster; that gap is the price of queue fairness plus a `fair_try_lock` with its own queue order. One thread is even (about 13 ns either way), and from 2 to 28 threads the ratio stays a fairly constant 2–3x. The important part is what is absent: throughput does not collapse at or above the core count. 28 threads on 28 logical processors hold 188.8 ns/op next to 151.4 at 16 threads — earlier revisions of this mutex fell into a park convoy past the physical core count and were over 40x slower there.
 
 With 64 `volatile` additions, the critical section covers most of the lock overhead. At one thread the two are even (79 vs 84 ns), and at 28 threads they sit at 312 vs 237 ns.
 
@@ -54,8 +54,8 @@ The correctness test is built with `-DASF_TRY_SPIN=0 -DASF_LOCK_SPIN=0 -DASF_COU
 
 `test_queue_mutex.exe` passed with exit code 0.
 
-- stress: 15000 `try_lock` calls, 13651 failures, about 91%.
-- 60 seconds with 64 threads: 28749556 `try_lock` calls, 28748684 failures; threads entered the critical section 17251540 times, about 287,500 times per second. Roughly 291,000 parks per second, expected with zeroed spin budgets.
+- stress: 15000 `fair_try_lock` calls, 13651 failures, about 91%.
+- 60 seconds with 64 threads: 28861294 `fair_try_lock` calls, 28860633 failures; threads entered the critical section 17318395 times, about 288,600 times per second. Roughly 291,000 parks per second, expected with zeroed spin budgets.
 - The plain counter and the relaxed atomic counter match. Depth is 0 at the end.
 
 ---
@@ -104,7 +104,7 @@ g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -o bench_mutex.e
 | 28 | std::mutex | 63.5 | 15.75 | 237.3 | 4.21 |
 | 28 | queue_mutex | 188.8 | 5.30 | 311.8 | 3.21 |
 
-临界区只有一次整数加法时，`std::mutex` 更快；这个差距就是公平队列加一个自带失败顺序的 `try_lock` 的代价。单线程打平（都约 13 ns），2 到 28 线程差距稳定在 2–3 倍。关键在于缺了什么：超过核数之后吞吐不再崩塌。28 个线程跑满 28 个逻辑处理器时是 188.8 ns/op，和 16 线程的 151.4 相邻——本互斥量的早期版本在超过物理核数后会陷入停车车队，在那里要慢 40 倍以上。
+临界区只有一次整数加法时，`std::mutex` 更快；这个差距就是公平队列加一个自带失败顺序的 `fair_try_lock` 的代价。单线程打平（都约 13 ns），2 到 28 线程差距稳定在 2–3 倍。关键在于缺了什么：超过核数之后吞吐不再崩塌。28 个线程跑满 28 个逻辑处理器时是 188.8 ns/op，和 16 线程的 151.4 相邻——本互斥量的早期版本在超过物理核数后会陷入停车车队，在那里要慢 40 倍以上。
 
 临界区改成 64 次 `volatile` 累加后，临界区盖住了锁开销的大部分。单线程两者打平（79 对 84 ns），28 线程时是 312 对 237 ns。
 
@@ -116,6 +116,6 @@ g++ -std=c++17 -Ofast -Wall -Wextra -pthread -static -I include -o bench_mutex.e
 
 `test_queue_mutex.exe` 通过，退出码 0。
 
-- stress：15000 次 `try_lock`，失败 13651 次，约 91%。
-- 60 秒、64 线程混跑：28749556 次 `try_lock`，失败 28748684 次。成功进入临界区 17251540 次，大约每秒 28.75 万次。每秒约 29.1 万次停车，预算归零后属预期。
+- stress：15000 次 `fair_try_lock`，失败 13651 次，约 91%。
+- 60 秒、64 线程混跑：28861294 次 `fair_try_lock`，失败 28860633 次。成功进入临界区 17318395 次，大约每秒 28.86 万次。每秒约 29.1 万次停车，预算归零后属预期。
 - 非原子计数与 relaxed 原子计数一致。结束时深度为 0。

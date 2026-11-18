@@ -1,6 +1,6 @@
 #pragma once
 
-// try_lock nodes form the spine. lock nodes hang off the current try_lock tail.
+// fair_try_lock nodes form the spine. lock nodes hang off the current try tail.
 // Each row below is one 64-bit CAS word: a 16-byte-aligned pointer in bits
 // [47:4], a 16-bit index in bits [63:48], and flags in bits [3:0].
 //
@@ -58,7 +58,7 @@ extern "C" int __ulock_wake(uint32_t operation, void* addr, uint64_t wake_value)
 
 namespace asf {
 
-// Give-up budget of the try_lock head. -DASF_TRY_SPIN overrides it.
+// Give-up budget of the fair_try_lock head. -DASF_TRY_SPIN overrides it.
 #ifndef ASF_TRY_SPIN
 #define ASF_TRY_SPIN 256
 #endif
@@ -115,11 +115,17 @@ class queue_mutex {
   // queue had drained at acquire time.
   void lock();
 
-  // A successful try retires its stack try_node before returning. unlock only
-  // clears state_. The try head polls ASF_TRY_SPIN times then gives up; a later
-  // try waits until it is head. Only the thread entering to acquire races for
-  // the owner.
+  // Traditional one-shot attempt: succeeds only when the mutex is grabbable
+  // right now (owner free, no try spine, no lock queue), may fail spuriously,
+  // and never queues or waits, so it takes no position in any order.
   [[nodiscard]] bool try_lock();
+
+  // Fair attempt: queues on the try spine and fails in its own queue order;
+  // a lock() takes no position in that order. A successful fair try retires
+  // its stack try_node before returning; unlock only clears state_. The head
+  // polls ASF_TRY_SPIN times then gives up; a later fair try waits until it
+  // is head. Only the thread entering to acquire races for the owner.
+  [[nodiscard]] bool fair_try_lock();
 
   void unlock();
 
@@ -787,7 +793,9 @@ inline bool queue_mutex::try_lock_contended(try_node& self) {
   return true;
 }
 
-inline bool queue_mutex::try_lock() {
+inline bool queue_mutex::try_lock() { return try_lock_fast(); }
+
+inline bool queue_mutex::fair_try_lock() {
   try_node node;
   return try_lock_contended(node);
 }

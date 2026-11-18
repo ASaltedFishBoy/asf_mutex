@@ -75,14 +75,29 @@ void test_try_fails_while_held() {
   }
 }
 
+void test_fair_try_basics() {
+  asf::queue_mutex mutex;
+  if (mutex.fair_try_lock()) {
+    mutex.unlock();
+  } else {
+    expect(false, "uncontended fair_try_lock");
+  }
+  mutex.lock();
+  expect(!mutex.fair_try_lock(), "fair_try_lock while lock held");
+  mutex.unlock();
+  expect(mutex.fair_try_lock(), "fair_try_lock reacquire");
+  expect(!mutex.fair_try_lock(), "fair_try_lock while fair try held");
+  mutex.unlock();
+}
+
 void test_lock_waits_for_try() {
   asf::queue_mutex mutex;
   std::atomic<int> phase{0};
   std::atomic<int> depth{0};
 
   std::thread holder([&] {
-    if (!mutex.try_lock()) {
-      expect(false, "holder try_lock");
+    if (!mutex.fair_try_lock()) {
+      expect(false, "holder fair_try_lock");
       phase.store(1, std::memory_order_relaxed);
       return;
     }
@@ -113,7 +128,7 @@ void test_lock_waits_for_try() {
 
 // One volatile increment, a few nanoseconds. Inside the critical section and
 // again between operations. Give-up is -DASF_TRY_SPIN=0 so this dwell, not a
-// microsecond pause, is what a failing try_lock races against.
+// microsecond pause, is what a failing fair_try_lock races against.
 void dwell() {
   volatile std::uint32_t step = 1;
   step = step + 1;
@@ -145,7 +160,7 @@ void worker_loop(asf::queue_mutex& mutex, std::atomic<bool>& stop, std::atomic<i
       mutex.unlock();
     } else {
       try_attempts.fetch_add(1, std::memory_order_relaxed);
-      if (mutex.try_lock()) {
+      if (mutex.fair_try_lock()) {
         hold(depth, entries);
         mutex.unlock();
       } else {
@@ -253,7 +268,7 @@ void test_stress() {
           mutex.unlock();
         } else {
           try_attempts.fetch_add(1, std::memory_order_relaxed);
-          if (mutex.try_lock()) {
+          if (mutex.fair_try_lock()) {
             hold(depth, entries);
             mutex.unlock();
           } else {
@@ -372,6 +387,7 @@ void test_lock_os_park() {
 int main() {
   test_uncontended();
   test_try_fails_while_held();
+  test_fair_try_basics();
   test_lock_waits_for_try();
   test_mixed();
   test_lock_os_park();
