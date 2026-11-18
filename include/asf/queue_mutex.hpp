@@ -67,8 +67,11 @@ namespace asf {
 #endif
 
 // lock wait spins before OS park. -DASF_LOCK_SPIN overrides the total budget.
+// Default covers one scheduling jitter (~85us at ~40ns per pause): a waiter
+// parks only after outlasting ordinary OS noise. Shorter budgets let one
+// jitter ignite a park convoy where every handoff pays a kernel wake.
 #ifndef ASF_LOCK_SPIN
-#define ASF_LOCK_SPIN 512
+#define ASF_LOCK_SPIN 2048
 #endif
 
 // Pause iterations assumed to happen inside the OS park call itself, subtracted
