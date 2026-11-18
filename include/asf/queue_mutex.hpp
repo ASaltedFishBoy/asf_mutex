@@ -282,10 +282,11 @@ class queue_mutex {
   alignas(64) std::atomic<std::uint64_t> state_{0};
   // lock_index | lock_tail | splice
   alignas(64) std::atomic<std::uint64_t> lock_tail_{0};
-  // Grant target for the next unlock: written by the holder at acquire when
-  // a successor exists, consumed back to null by every unlock. Null whenever
-  // the lock queue is empty; in particular null while a try holds, so try
-  // unlock always takes the state_ path.
+  // Grant target for the holder's own unlock: written by the holder at
+  // acquire (successor pointer, or null when the queue drained there). Only
+  // the holder ever writes it, so unlock is a plain load of its own store.
+  // Null whenever the lock queue is empty; in particular null while a try
+  // holds, so try unlock always takes the state_ path.
   alignas(64) std::atomic<std::uint64_t> lock_front_{0};
 };
 
@@ -368,13 +369,14 @@ inline void queue_mutex::wake_word(std::atomic<std::uint64_t>& word) noexcept {
 #endif
 }
 
-// Record the successor unlock should grant. Same lookup as the classic MCS
-// release (swing the tail clear when nobody follows); the pointer goes to
+// Record what the holder's own unlock should do. Same lookup as the classic
+// MCS release (swing the tail clear when nobody follows); the outcome goes to
 // lock_front_ so the grant can happen at unlock time, after this stack node
-// died unreferenced. Nothing is stored when nobody follows: the previous
-// unlock already consumed lock_front_ back to null, so it is null exactly
-// when the queue is empty. The successor is marked head only when we never
-// parked ourselves (adaptive pre-wake, see below).
+// died unreferenced. The holder is the only writer of that word -- successor
+// pointer, or null when the queue drained here -- so unlock is a plain load
+// of its own store, with no consume ordering against the grant. The
+// successor is marked head only when we never parked ourselves (adaptive
+// pre-wake, see below).
 inline void queue_mutex::publish_successor(lock_node& self) {
   std::uint64_t mine = self.word.load(std::memory_order_relaxed);
   lock_node* next = ptr_of<lock_node>(mine);
@@ -382,6 +384,9 @@ inline void queue_mutex::publish_successor(lock_node& self) {
     std::uint64_t cur = lock_tail_.load(std::memory_order_relaxed);
     if (ptr_of<lock_node>(cur) == &self && (cur & kSplice) == 0 &&
         cas(lock_tail_, cur, pack_indexed(nullptr, index_of(cur), 0))) {
+      // Queue drained: leave front null for the holder's own unlock, which
+      // loads whatever this acquire leaves here.
+      lock_front_.store(0, std::memory_order_relaxed);
       return;
     }
     std::uint32_t spins = 0;
@@ -782,9 +787,10 @@ inline bool queue_mutex::try_lock() {
 
 inline void queue_mutex::unlock() {
   std::atomic_thread_fence(std::memory_order_release);
-  // Consume the target before granting: the granted successor stores its own
-  // successor here at its acquire, and that store must land after this one.
-  lock_node* next = ptr_of<lock_node>(lock_front_.exchange(0, std::memory_order_relaxed));
+  // Pure read: the holder wrote this word itself at acquire (successor
+  // pointer, or null when the queue drained there), and nobody else ever
+  // writes it, so this load returns this thread's own store.
+  lock_node* next = ptr_of<lock_node>(lock_front_.load(std::memory_order_relaxed));
   if (next != nullptr) {
     // Steady-state handoff: the grant bit alone makes the successor the
     // holder. state_ keeps owner=kLock; no meta word is written here.
