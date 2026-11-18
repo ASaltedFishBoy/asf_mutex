@@ -29,12 +29,9 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <thread>
-
-#if defined(ASF_COUNT_PARK)
-#include <chrono>
-#endif
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -171,6 +168,12 @@ class queue_mutex {
   // OS park: a descheduled holder gets this core before we pay a kernel wake
   // for it. Bounded so a wait must reach the park after finite progress.
   static constexpr std::uint32_t kYieldBridge = 12;
+  // Standby wake pipeline: when a queued grant finds its target parked, walk
+  // the chain and mark further nodes head so their wakes are already in
+  // flight when their turn comes. The count follows the last measured grant
+  // gap, one standby per kNsPerStandby of observed handoff latency.
+  static constexpr std::uint32_t kStandbyMax = 8;
+  static constexpr std::uint64_t kNsPerStandby = 1024;
   static constexpr std::uint32_t kTry = 1;
   static constexpr std::uint32_t kLock = 2;
 
@@ -288,6 +291,10 @@ class queue_mutex {
   // Null whenever the lock queue is empty; in particular null while a try
   // holds, so try unlock always takes the state_ path.
   alignas(64) std::atomic<std::uint64_t> lock_front_{0};
+  // Last queued-grant timestamp (steady_clock ns), holder-private and sharing
+  // lock_front_'s line: the gap between stamps measures the handoff latency
+  // that sizes the standby pipeline at unlock.
+  std::atomic<std::uint64_t> grant_ts_{0};
 };
 
 inline void queue_mutex::pause() noexcept {
@@ -792,6 +799,31 @@ inline void queue_mutex::unlock() {
   // writes it, so this load returns this thread's own store.
   lock_node* next = ptr_of<lock_node>(lock_front_.load(std::memory_order_relaxed));
   if (next != nullptr) {
+    // The grant target is alive until granted, so its word can be read here;
+    // nothing of it may be touched after grant_node below.
+    const std::uint64_t word = next->word.load(std::memory_order_relaxed);
+    if ((word & kParked) != 0) {
+      // Convoy regime: handoffs are wake-limited while parked waiters leave
+      // cores idle. Pipeline the wakes -- mark the next few queued nodes
+      // head, so their wake latency overlaps the turns ahead of them. Every
+      // node walked is ungranted (grants happen in chain order), hence
+      // alive; all marking finishes before the grant, so no node is touched
+      // once it can die. The count follows the last grant gap: one standby
+      // per ~1us of observed handoff latency, refilling deeper the slower
+      // the convoy runs. Fast-lane grants find no parked bit and skip this.
+      const std::uint64_t now = static_cast<std::uint64_t>(
+          std::chrono::steady_clock::now().time_since_epoch().count());
+      const std::uint64_t prev = grant_ts_.exchange(now, std::memory_order_relaxed);
+      std::uint64_t count = (now - prev) / kNsPerStandby;
+      if (count > kStandbyMax) {
+        count = kStandbyMax;
+      }
+      lock_node* standby = ptr_of<lock_node>(word);
+      for (std::uint64_t i = 0; i < count && standby != nullptr; ++i) {
+        mark_head(*standby);
+        standby = ptr_of<lock_node>(standby->word.load(std::memory_order_relaxed));
+      }
+    }
     // Steady-state handoff: the grant bit alone makes the successor the
     // holder. state_ keeps owner=kLock; no meta word is written here.
     grant_node(*next);
