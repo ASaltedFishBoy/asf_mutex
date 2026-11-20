@@ -14,9 +14,11 @@
 //
 // lock_node.word:   parked | grant | head | lock_index | next
 // A node that saw a null tail already knows it is the head and keeps that in
-// a local. The head bit is only written into a successor that is waiting.
-// try unlock frees the owner; that head takes the mutex itself. The parked
-// bit is set only once that node is about to sleep, and only then does the
+// a local. The head bit is written into a waiting successor: unconditionally
+// for a genuine front -- try unlock frees the owner and only a front polling
+// state_ takes the mutex itself -- but for a standby wake only once the node
+// parked, since a spinner already watches its own word. The parked bit is
+// set only once that node is about to sleep, and only then does the
 // predecessor wake it.
 //
 // A node never keeps the tail it displaced. That pointer is used once, to
@@ -63,10 +65,13 @@ namespace asf {
 #define ASF_TRY_SPIN 256
 #endif
 
-// lock wait spins before OS park. -DASF_LOCK_SPIN overrides the total budget.
-// Default covers one scheduling jitter (~85us at ~40ns per pause): a waiter
-// parks only after outlasting ordinary OS noise. Shorter budgets let one
-// jitter ignite a park convoy where every handoff pays a kernel wake.
+// Total spin budget of one acquisition: the lock() fast lane, the try_lock
+// retries, and the queue wait all spend from this one count, so a waiter
+// parks after the same total delay however the spins were divided.
+// -DASF_LOCK_SPIN overrides it. Default covers one scheduling jitter (~85us
+// at ~40ns per pause): a waiter parks only after outlasting ordinary OS
+// noise. Shorter budgets let one jitter ignite a park convoy where every
+// handoff pays a kernel wake.
 #ifndef ASF_LOCK_SPIN
 #define ASF_LOCK_SPIN 2048
 #endif
@@ -109,15 +114,16 @@ class queue_mutex {
   queue_mutex(const queue_mutex&) = delete;
   queue_mutex& operator=(const queue_mutex&) = delete;
 
-  // Uncontended lock CAS-es state_ and never builds a node. Contended lock
-  // parks on a stack lock_node, then records the successor in lock_front_
-  // before returning; unlock grants that node, or frees state_ when the
-  // queue had drained at acquire time.
+  // Uncontended lock retries one CAS on state_ within the shared spin count
+  // and builds no node on success. Contended lock parks on a stack lock_node,
+  // then records the successor in lock_front_ before returning; unlock grants
+  // that node, or frees state_ when the queue had drained at acquire time.
   void lock();
 
-  // Traditional one-shot attempt: succeeds only when the mutex is grabbable
-  // right now (owner free, no try spine, no lock queue), may fail spuriously,
-  // and never queues or waits, so it takes no position in any order.
+  // Unfair attempt: succeeds only when the mutex is grabbable (owner free, no
+  // try spine, no lock queue), retrying within the shared ASF_LOCK_SPIN count
+  // while the mutex is merely held and failing at once once anything queues.
+  // Never queues itself, so it takes no position in any order.
   [[nodiscard]] bool try_lock();
 
   // Fair attempt: queues on the try spine and fails in its own queue order;
@@ -177,9 +183,16 @@ class queue_mutex {
   // Standby wake pipeline: when a queued grant finds its target parked, walk
   // the chain and mark further nodes head so their wakes are already in
   // flight when their turn comes. The count follows the last measured grant
-  // gap, one standby per kNsPerStandby of observed handoff latency.
+  // gap, one standby per kTicksPerStandby of observed handoff latency.
   static constexpr std::uint32_t kStandbyMax = 8;
-  static constexpr std::uint64_t kNsPerStandby = 1024;
+  // Counts, not ns -- like the spin budgets, so the sizing follows the
+  // machine's own rhythm (frequency, cache-sync speed) instead of pinning
+  // the tuning to one frequency. ~1us on a 2GHz part.
+  static constexpr std::uint64_t kTicksPerStandby = 2048;
+  // Pre-wake allowance for a parked entry: wake the successor at acquire
+  // only when the last measured hold says this critical section hides a wake
+  // for less than the successor's early spin burns.
+  static constexpr std::uint64_t kPreWakeMaxTicks = 4 * kTicksPerStandby;
   static constexpr std::uint32_t kTry = 1;
   static constexpr std::uint32_t kLock = 2;
 
@@ -249,7 +262,27 @@ class queue_mutex {
     }
   }
 
+  // Standby wake hint. Set only once the node parked: a spinner already
+  // watches its own word for the grant, and marking it would push it onto
+  // the state_-polling head branch, which has no park exit. A node that
+  // parks right after this load sleeps until its own grant, losing nothing
+  // but a pipeline slot. kParked is never cleared, so a load that finds it
+  // set cannot miss a node that ever slept.
   static void mark_head(lock_node& node) {
+    std::uint64_t cur = node.word.load(std::memory_order_relaxed);
+    if ((cur & kParked) == 0) {
+      return;
+    }
+    cur = node.word.fetch_or(kHead, std::memory_order_relaxed);
+    if ((cur & kParked) != 0) {
+      wake_word(node.word);
+    }
+  }
+
+  // Genuine front of a state_-driven queue: the owner is freed without
+  // touching this word, so the head bit is load-bearing here -- the node
+  // must leave its word and poll state_. Set whether it spins or sleeps.
+  static void mark_front(lock_node& node) {
     const std::uint64_t cur = node.word.fetch_or(kHead, std::memory_order_relaxed);
     if ((cur & kParked) != 0) {
       wake_word(node.word);
@@ -264,10 +297,10 @@ class queue_mutex {
     }
   }
 
-  void lock_contended(lock_node& self);
-  void wait_lock(lock_node& self, bool head);
+  void lock_contended(lock_node& self, std::uint32_t& spins);
+  void wait_lock(lock_node& self, bool head, std::uint32_t& spins);
   void publish_successor(lock_node& self);
-  bool try_lock_fast();
+  bool try_lock_fast(std::uint32_t& spins);
   bool try_lock_contended(try_node& self);
   bool join_segment(lock_node& self, try_node& owner, std::uint16_t index, std::uint16_t prev);
   bool join_origin(lock_node& self, std::uint16_t index, std::uint16_t prev);
@@ -281,6 +314,7 @@ class queue_mutex {
   void wake_next(try_node* next);
   static void pause() noexcept;
   static void relax(std::uint32_t& spins) noexcept;
+  static std::uint64_t tick_count() noexcept;
   static void park_word(std::atomic<std::uint64_t>& word, std::uint64_t expected) noexcept;
   static void wake_word(std::atomic<std::uint64_t>& word) noexcept;
 
@@ -297,10 +331,18 @@ class queue_mutex {
   // Null whenever the lock queue is empty; in particular null while a try
   // holds, so try unlock always takes the state_ path.
   alignas(64) std::atomic<std::uint64_t> lock_front_{0};
-  // Last queued-grant timestamp (steady_clock ns), holder-private and sharing
+  // Last queued-grant stamp (tick counts), holder-private and sharing
   // lock_front_'s line: the gap between stamps measures the handoff latency
   // that sizes the standby pipeline at unlock.
   std::atomic<std::uint64_t> grant_ts_{0};
+  // Acquire stamp of a holder that parked on its way in (0 when it did not),
+  // holder-private and sharing the same line; read back at the queued unlock
+  // to measure the hold below.
+  std::atomic<std::uint64_t> acquire_ts_{0};
+  // Last hold measured from a parked entry (tick counts). The pre-wake gates
+  // on this count rather than on how the acquiring waiter itself happened to
+  // wait.
+  std::atomic<std::uint64_t> hold_ticks_{0};
 };
 
 inline void queue_mutex::pause() noexcept {
@@ -336,6 +378,27 @@ inline void queue_mutex::pause() noexcept {
 inline void queue_mutex::relax(std::uint32_t& spins) noexcept {
   pause();
   ++spins;
+}
+
+// A cheap machine-rhythm stamp: rdtsc on x86, steady_clock elsewhere. Gaps
+// measured in these counts scale with the part's own frequency and cache
+// synchronization speed, so thresholds in counts travel across CPUs the way
+// the pause-count spin budgets do; nanoseconds would pin the tuning to one
+// frequency.
+inline std::uint64_t queue_mutex::tick_count() noexcept {
+#if defined(__x86_64__) && !defined(_MSC_VER)
+  std::uint32_t lo, hi;
+  // serializes like RDTSCP but stays a leaf; the counter is the same TSC
+  __asm__ __volatile__("lfence; rdtsc" : "=a"(lo), "=d"(hi));
+  return (static_cast<std::uint64_t>(hi) << 32) | lo;
+#elif defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+  return __rdtsc();
+#elif defined(__i386__)
+  return __builtin_ia32_rdtsc();
+#else
+  return static_cast<std::uint64_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
 }
 
 inline void queue_mutex::park_word(std::atomic<std::uint64_t>& word,
@@ -388,7 +451,8 @@ inline void queue_mutex::wake_word(std::atomic<std::uint64_t>& word) noexcept {
 // died unreferenced. The holder is the only writer of that word -- successor
 // pointer, or null when the queue drained here -- so unlock is a plain load
 // of its own store, with no consume ordering against the grant. The
-// successor is marked head only when we never parked ourselves (adaptive
+// successor is marked head early on a spin entry, or on a parked entry when
+// the last measured hold is short enough to hide the wake (adaptive
 // pre-wake, see below).
 inline void queue_mutex::publish_successor(lock_node& self) {
   std::uint64_t mine = self.word.load(std::memory_order_relaxed);
@@ -408,19 +472,24 @@ inline void queue_mutex::publish_successor(lock_node& self) {
     }
   }
   lock_front_.store(ptr_bits(next), std::memory_order_relaxed);
-  // Adaptive pre-wake. We never parked on our own wait (spin entry), so
-  // handoffs are cheap right now and the successor is likely spinning too:
-  // mark it head, it standby-polls, and unlock's grant reaches an awake
-  // thread. Had we been woken ourselves, the regime is slow; leave the
-  // successor on its own spin-then-park path rather than burn a core
-  // through our critical section.
+  // Adaptive pre-wake. A spin entry says handoffs are fast right now, so the
+  // early wake is free to send (and mark_head skips the successor while it
+  // spins anyway). A parked entry only says our own wait was slow; it says
+  // nothing about how long this critical section will keep a woken successor
+  // spinning, so that case is gated on time instead: stamp the acquire, and
+  // pre-wake only when the last measured hold says the section hides a wake
+  // for less than it burns.
   if ((mine & kParked) == 0) {
+    mark_head(*next);
+    return;
+  }
+  acquire_ts_.store(tick_count(), std::memory_order_relaxed);
+  if (hold_ticks_.load(std::memory_order_relaxed) <= kPreWakeMaxTicks) {
     mark_head(*next);
   }
 }
 
-inline void queue_mutex::wait_lock(lock_node& self, bool head) {
-  std::uint32_t spins = 0;
+inline void queue_mutex::wait_lock(lock_node& self, bool head, std::uint32_t& spins) {
   std::uint32_t yields = 0;
   std::uint64_t word = self.word.load(std::memory_order_relaxed);
   for (;;) {
@@ -523,9 +592,8 @@ inline bool queue_mutex::join_origin(lock_node& self, std::uint16_t index, std::
   }
 }
 
-inline void queue_mutex::lock_contended(lock_node& self) {
+inline void queue_mutex::lock_contended(lock_node& self, std::uint32_t& spins) {
   self.word.store(0, std::memory_order_relaxed);
-  std::uint32_t spins = 0;
   std::uint64_t state = state_.load(std::memory_order_relaxed);
   for (;;) {
     const std::uint16_t prev = index_of(state);
@@ -536,36 +604,49 @@ inline void queue_mutex::lock_contended(lock_node& self) {
     }
     try_node* tail = ptr_of<try_node>(state);
     if (tail == nullptr) {
-      wait_lock(self, join_origin(self, index, prev));
+      wait_lock(self, join_origin(self, index, prev), spins);
       return;
     }
-    wait_lock(self, join_segment(self, *tail, index, prev));
+    wait_lock(self, join_segment(self, *tail, index, prev), spins);
     return;
   }
 }
 
-inline bool queue_mutex::try_lock_fast() {
-  std::uint64_t state = state_.load(std::memory_order_relaxed);
-  if (owner_of(state) != kFree || ptr_of<try_node>(state) != nullptr) {
-    return false;
+inline bool queue_mutex::try_lock_fast(std::uint32_t& spins) {
+  // Grabbable-right-now conditions retried against the caller's overall spin
+  // count: lock() spends from the same count its queue wait continues with,
+  // and a plain try_lock fails when the count runs out. The spin happens only
+  // while the mutex is merely held -- the lane dissolves the moment anything
+  // queues anywhere (try spine or lock tail), so contended arrivals fail on
+  // their first pass and reach the queue with a full budget, keeping the
+  // convoy regime's whole wait spin. Retry never barges a queued front.
+  for (;;) {
+    std::uint64_t state = state_.load(std::memory_order_relaxed);
+    if (ptr_of<try_node>(state) != nullptr) {
+      return false;
+    }
+    const std::uint64_t tail = lock_tail_.load(std::memory_order_relaxed);
+    if (ptr_of<lock_node>(tail) != nullptr) {
+      return false;
+    }
+    if (owner_of(state) == kFree && cas(state_, state, with_owner(state, kLock))) {
+      std::atomic_thread_fence(std::memory_order_acquire);
+      return true;
+    }
+    if (spins >= kLockSpin) {
+      return false;
+    }
+    relax(spins);
   }
-  const std::uint64_t tail = lock_tail_.load(std::memory_order_relaxed);
-  if (ptr_of<lock_node>(tail) != nullptr || (tail & kSplice) != 0) {
-    return false;
-  }
-  if (!cas(state_, state, with_owner(state, kLock))) {
-    return false;
-  }
-  std::atomic_thread_fence(std::memory_order_acquire);
-  return true;
 }
 
 inline void queue_mutex::lock() {
-  if (try_lock_fast()) {
+  std::uint32_t spins = 0;
+  if (try_lock_fast(spins)) {
     return;
   }
   lock_node node;
-  lock_contended(node);
+  lock_contended(node, spins);
 }
 
 inline void queue_mutex::splice_segment(try_node& self, std::uint64_t segment) {
@@ -593,7 +674,7 @@ inline void queue_mutex::splice_segment(try_node& self, std::uint64_t segment) {
     lock_node* origin = ptr_of<lock_node>(tail_word);
     if (origin == nullptr) {
       lock_tail_.store(pack_indexed(tail, index_of(cur), 0), std::memory_order_relaxed);
-      mark_head(*head);
+      mark_front(*head);
       return;
     }
     if (cas(lock_tail_, tail_word, pack_indexed(tail, index_of(cur), 0))) {
@@ -793,7 +874,10 @@ inline bool queue_mutex::try_lock_contended(try_node& self) {
   return true;
 }
 
-inline bool queue_mutex::try_lock() { return try_lock_fast(); }
+inline bool queue_mutex::try_lock() {
+  std::uint32_t spins = 0;
+  return try_lock_fast(spins);
+}
 
 inline bool queue_mutex::fair_try_lock() {
   try_node node;
@@ -810,19 +894,31 @@ inline void queue_mutex::unlock() {
     // The grant target is alive until granted, so its word can be read here;
     // nothing of it may be touched after grant_node below.
     const std::uint64_t word = next->word.load(std::memory_order_relaxed);
+    const std::uint64_t stamped = acquire_ts_.load(std::memory_order_relaxed);
+    std::uint64_t now = 0;
+    if (stamped != 0 || (word & kParked) != 0) {
+      now = tick_count();
+    }
+    if (stamped != 0) {
+      // This holder parked on its way in and stamped its acquire: record the
+      // hold it just had -- the input of the next parked entry's pre-wake.
+      hold_ticks_.store(now - stamped, std::memory_order_relaxed);
+      acquire_ts_.store(0, std::memory_order_relaxed);
+    }
     if ((word & kParked) != 0) {
       // Convoy regime: handoffs are wake-limited while parked waiters leave
       // cores idle. Pipeline the wakes -- mark the next few queued nodes
-      // head, so their wake latency overlaps the turns ahead of them. Every
-      // node walked is ungranted (grants happen in chain order), hence
-      // alive; all marking finishes before the grant, so no node is touched
-      // once it can die. The count follows the last grant gap: one standby
-      // per ~1us of observed handoff latency, refilling deeper the slower
-      // the convoy runs. Fast-lane grants find no parked bit and skip this.
-      const std::uint64_t now = static_cast<std::uint64_t>(
-          std::chrono::steady_clock::now().time_since_epoch().count());
+      // head, so their wake latency overlaps the turns ahead of them. Nodes
+      // still spinning are left alone by mark_head: they already watch
+      // their own word, and a mark would push them onto the state_ poll
+      // with no park exit. Every node walked is ungranted (grants happen in
+      // chain order), hence alive; all marking finishes before the grant,
+      // so no node is touched once it can die. The count follows the last
+      // grant gap: one standby per kTicksPerStandby of observed handoff latency,
+      // refilling deeper the slower the convoy runs. Fast-lane grants find
+      // no parked bit and skip this.
       const std::uint64_t prev = grant_ts_.exchange(now, std::memory_order_relaxed);
-      std::uint64_t count = (now - prev) / kNsPerStandby;
+      std::uint64_t count = (now - prev) / kTicksPerStandby;
       if (count > kStandbyMax) {
         count = kStandbyMax;
       }
